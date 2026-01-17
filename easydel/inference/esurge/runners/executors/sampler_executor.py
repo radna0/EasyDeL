@@ -99,11 +99,7 @@ class SamplerExecutor:
             return
 
         vocab_size = int(self.model.config.get_text_config().vocab_size)
-        dummy_logits = jnp.zeros(
-            (int(padded_num_reqs), vocab_size),
-            dtype=self.model.dtype,
-            out_sharding=self._empty_sharding,
-        )
+        dummy_logits = jnp.zeros((int(padded_num_reqs), vocab_size), dtype=self.model.dtype)
 
         sampler_args = (
             metadata,

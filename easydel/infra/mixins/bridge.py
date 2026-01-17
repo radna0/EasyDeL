@@ -567,6 +567,24 @@ class EasyBridgeMixin(PushToHubMixin):
                 load_treedef=False,
                 **extraargs,
             )
+            # `save_pretrained()` writes a non-versioned checkpoint directly under
+            # base_path (no run-{step} subdir). If discover_latest finds nothing,
+            # fall back to loading the base_path directly.
+            if state is None:
+                state, _ = Checkpointer(
+                    base_path=str(resolved_archive_file),
+                    save_interval=None,
+                    step_policies=[],
+                ).load_pytree(
+                    mesh=mesh,
+                    dtype=param_dtype,  # legacy
+                    partition_rules=model.config.get_partition_rules(),
+                    prefix="model",
+                    discover_latest=False,
+                    discover_raise=True,
+                    load_treedef=False,
+                    **extraargs,
+                )
             params = state.get("params", None)
 
             if params is not None:

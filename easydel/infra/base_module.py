@@ -72,7 +72,10 @@ from copy import deepcopy
 from dataclasses import dataclass
 from functools import cached_property, partial
 from re import Pattern
-from typing import Self, Unpack
+try:
+    from typing import Self, Unpack
+except ImportError:  # Python < 3.11
+    from typing_extensions import Self, Unpack
 
 import flax
 import flax.nnx

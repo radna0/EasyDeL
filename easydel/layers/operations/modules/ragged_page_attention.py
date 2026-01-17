@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 import jax
 from eformer import common_types as ct
 from ejkernel.modules import ragged_page_attention_v2, ragged_page_attention_v3
@@ -83,6 +84,7 @@ class _RaggedPageAttn(OperationImpl):
         optimized: bool = False,
         sliding_window: int | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
+        causal: bool = True,
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
         **ignore,
@@ -106,11 +108,21 @@ class _RaggedPageAttn(OperationImpl):
         else:
             dtype_for_compute = compute_dtype
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
+        forced = os.environ.get("EASYDEL_RAGGED_PAGE_ATTN_V2_PLATFORM", "").strip().lower()
+        if forced in ("xla", "pallas", "auto"):
+            platform = forced
         cfg = self.metadata.get_operation_config("ragged_page_attention_v2")
 
         if platform == "pallas":
             if query.shape[-1] not in [128, 256]:
                 platform = "xla"
+
+        # DFlash verify requires causal attention. `ragged_page_attention_v2`
+        # exposes masking via `mask_value`; if callers rely on `causal=True` but
+        # do not set `mask_value`, multi-token verify can become non-causal on
+        # some backends. Default the causal mask value here.
+        if bool(causal) and mask_value is None:
+            mask_value = -1.0e9
 
         output = ragged_page_attention_v2(
             query,

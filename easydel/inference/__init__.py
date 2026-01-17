@@ -40,18 +40,40 @@ Attributes:
     vWhisperInferenceConfig: Configuration for vWhisper
 """
 
-from .esurge import EngineRequest, EngineRequestStatus, eSurge, eSurgeApiServer, eSurgeRunner
-from .oai_proxies import InferenceApiRouter
 from .sampling_params import JitableSamplingParams, SamplingParams
-from .tools import ToolParser, ToolParserManager
-from .vwhisper import vWhisperInference, vWhisperInferenceConfig
+from .speculative.dflash import dflash_accept_len_and_bonus
+from .speculative.dflash_decode import dflash_cached_decode_blockverify
+
+# Optional imports (avoid forcing server deps like fastapi during TPU runs).
+try:  # pragma: no cover
+    from .esurge import EngineRequest, EngineRequestStatus, eSurge, eSurgeApiServer, eSurgeRunner
+except Exception:  # pragma: no cover
+    EngineRequest = EngineRequestStatus = eSurge = eSurgeApiServer = eSurgeRunner = None  # type: ignore
+
+try:  # pragma: no cover
+    from .oai_proxies import InferenceApiRouter
+except Exception:  # pragma: no cover
+    InferenceApiRouter = None  # type: ignore
+
+try:  # pragma: no cover
+    from .tools import ToolParser, ToolParserManager
+except Exception:  # pragma: no cover
+    ToolParser = ToolParserManager = None  # type: ignore
+
+try:  # pragma: no cover
+    from .vwhisper import vWhisperInference, vWhisperInferenceConfig
+except Exception:  # pragma: no cover
+    vWhisperInference = vWhisperInferenceConfig = None  # type: ignore
 
 __all__ = (
+    "JitableSamplingParams",
+    "SamplingParams",
+    "dflash_accept_len_and_bonus",
+    "dflash_cached_decode_blockverify",
+    # Optional exports (may be None if deps missing)
     "EngineRequest",
     "EngineRequestStatus",
     "InferenceApiRouter",
-    "JitableSamplingParams",
-    "SamplingParams",
     "ToolParser",
     "ToolParserManager",
     "eSurge",

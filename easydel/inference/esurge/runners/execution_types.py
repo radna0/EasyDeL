@@ -172,6 +172,23 @@ class ModelStepOutputs:
 
 
 @auto_pytree(frozen=True)
+class VerifyStepOutputs:
+    """Outputs returned from a verify-mode model forward pass.
+
+    Verify-mode is used by speculative decoding algorithms (e.g. DFlash) that
+    need per-token greedy predictions over a small verification window, rather
+    than a single next-token row.
+
+    To keep TPU memory/compile pressure low for large-vocab models, verify-mode
+    returns greedy token IDs instead of full logits.
+    """
+
+    kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
+    context_features: jax.Array
+    greedy_token_ids: jax.Array
+
+
+@auto_pytree(frozen=True)
 class StepFunctionInputs:
     """Consolidated inputs for fused step execution.
 

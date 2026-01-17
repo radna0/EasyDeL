@@ -188,6 +188,7 @@ class eSurgeRunner:
         verbose: bool = False,
         enable_overlap_execution: bool = False,
         enable_sampler_metrics: bool = False,
+        capture_hidden_states: bool = False,
     ):
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
@@ -256,6 +257,7 @@ class eSurgeRunner:
         self._setup_variables()
         self.enable_overlap_execution = enable_overlap_execution
         self.enable_sampler_metrics = enable_sampler_metrics
+        self.capture_hidden_states = bool(capture_hidden_states)
 
         # Perf logging state (kept lightweight; no allocations in the hot path).
         self._perf_iteration = 0
@@ -1077,6 +1079,7 @@ class eSurgeRunner:
                 spec_token_ids=None,
                 logprobs=None,
                 prompt_logprobs_dict={},
+                hidden_states_by_req=None,
                 finished_sending=None,
                 finished_recving=None,
                 num_nans_in_logits=None,
@@ -1089,6 +1092,7 @@ class eSurgeRunner:
         req_ids_all: list[str] = []
         sampled_token_ids_all: list[list[int]] = []
         token_logprobs: dict[str, float] = {}
+        hidden_chunks_by_req: dict[str, list[object]] | None = {} if self.capture_hidden_states else None
 
         # Window-level perf aggregation (a single scheduler step can span multiple windows).
         num_windows = 0
@@ -1326,6 +1330,7 @@ class eSurgeRunner:
             tokens_np = np.asarray(out_tokens_win)
             valid_np = np.asarray(valid_mask_win)
             logits_np = np.asarray(_logits) if self.enable_sampler_metrics and _logits is not None else None
+            hidden_np = np.asarray(_hidden_states) if self.capture_hidden_states and _hidden_states is not None else None
             total_d2h_time += time.time() - d2h_start
 
             # Track for async scheduling
@@ -1333,10 +1338,17 @@ class eSurgeRunner:
             discard_sampled_tokens_req_indices: list[int] = []
 
             up_wtime = time.time()
+            off_h = 0
             for i, rid in enumerate(req_ids_window):
                 if rid is None:
                     continue
                 req_ids_all.append(rid)
+
+                if hidden_np is not None and hidden_chunks_by_req is not None:
+                    n_h = int(scheduled_list[i]) if i < len(scheduled_list) else 0
+                    if n_h > 0:
+                        hidden_chunks_by_req.setdefault(rid, []).append(hidden_np[off_h : off_h + n_h].copy())
+                    off_h += max(n_h, 0)
 
                 if valid_np[i]:
                     tid = int(tokens_np[i])
@@ -1449,6 +1461,21 @@ class eSurgeRunner:
             f"total={total_time * 1e3:.2f}ms"
         )
 
+        hidden_states_by_req: dict[str, object] | None = None
+        if hidden_chunks_by_req is not None:
+            packed: dict[str, object] = {}
+            for rid, chunks in hidden_chunks_by_req.items():
+                if not chunks:
+                    continue
+                if len(chunks) == 1:
+                    packed[rid] = chunks[0]
+                else:
+                    try:
+                        packed[rid] = np.concatenate(chunks, axis=0)
+                    except Exception:
+                        packed[rid] = chunks
+            hidden_states_by_req = packed
+
         # Handle async scheduling return
         if scheduler_output.async_scheduling:
             # Set placeholders for current batch
@@ -1479,6 +1506,7 @@ class eSurgeRunner:
                 spec_token_ids=None,
                 logprobs=None,
                 prompt_logprobs_dict={rid: None for rid in req_ids_all},
+                hidden_states_by_req=hidden_states_by_req,
                 finished_sending=None,
                 finished_recving=None,
                 token_logprobs=token_logprobs or None,
@@ -1493,6 +1521,7 @@ class eSurgeRunner:
             spec_token_ids=None,
             logprobs=None,
             prompt_logprobs_dict={rid: None for rid in req_ids_all},
+            hidden_states_by_req=hidden_states_by_req,
             finished_sending=None,
             finished_recving=None,
             token_logprobs=token_logprobs or None,

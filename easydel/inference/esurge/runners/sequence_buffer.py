@@ -521,6 +521,31 @@ class SequenceBuffer:
         self._update_request_distribution()
         return req_index
 
+    def set_num_tokens(self, req_id: str, num_tokens: int) -> None:
+        """Force-update total token count for a request (advanced use).
+
+        Used by speculative decoding implementations that commit multiple tokens
+        at once (or roll back speculative extensions) and need to keep the
+        SequenceBuffer in sync with KV-cache state.
+        """
+        idx = self.req_id_to_index.get(req_id)
+        if idx is None:
+            raise KeyError(f"Unknown req_id: {req_id}")
+        self.num_tokens[idx] = min(int(num_tokens), self.max_model_len)
+        self.num_tokens_no_spec[idx] = self.num_tokens[idx]
+
+    def set_num_computed_tokens(self, req_id: str, num_computed_tokens: int) -> None:
+        """Force-update computed token count for a request (advanced use).
+
+        `num_computed_tokens` is the prefix length whose KV-cache entries are
+        considered valid/committed. It may be decreased when rolling back a
+        speculative window (KV pages remain allocated but are treated as unused).
+        """
+        idx = self.req_id_to_index.get(req_id)
+        if idx is None:
+            raise KeyError(f"Unknown req_id: {req_id}")
+        self.num_computed_tokens[idx] = min(int(num_computed_tokens), self.max_model_len)
+
     def swap_states(self, i1: int, i2: int) -> None:
         """Swap the states of two requests at given indices.
 

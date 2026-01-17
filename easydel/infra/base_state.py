@@ -59,7 +59,10 @@ import os
 import pickle
 import traceback
 import typing as tp
-from typing import Self
+try:
+    from typing import Self
+except ImportError:  # Python < 3.11
+    from typing_extensions import Self
 
 import jax
 import optax
@@ -582,12 +585,41 @@ class EasyDeLState(struct.PyTreeNode):
         else:
             logger.info("Skipping optimizer saving as requested.")
 
-        self.model.save_pretrained(
-            save_directory=save_directory,
-            gather_fns=self.model._gather_fns,
-            float_dtype=float_dtype,
-            step=step,
+        # Many EasyDeL modules implement `save_pretrained` (HF-like). For custom
+        # NNX modules that don't, fall back to saving `graphstate` with the
+        # standard Checkpointer format.
+        if hasattr(self.model, "save_pretrained"):
+            self.model.save_pretrained(
+                save_directory=save_directory,
+                gather_fns=getattr(self.model, "_gather_fns", None),
+                float_dtype=float_dtype,
+                step=step,
+            )
+            return
+
+        save_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            import json as _json
+            from dataclasses import asdict, is_dataclass
+
+            cfg = getattr(self.model, "config", None)
+            if cfg is not None and is_dataclass(cfg):
+                (save_directory / "config.json").write_text(_json.dumps(asdict(cfg), indent=2, sort_keys=True))
+        except Exception:
+            ...
+
+        checkpointer = Checkpointer(
+            base_path=save_directory,
+            save_interval=None,
+            step_policies=[],
         )
+        with self.model.mesh:
+            checkpointer.save_pytree(
+                tree=self.graphstate,
+                mesh=self.model.mesh,
+                dtype=float_dtype,
+                prefix="model",
+            )
 
     @classmethod
     def load_state(

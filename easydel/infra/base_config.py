@@ -49,7 +49,12 @@ import os
 import re
 import typing as tp
 import warnings
-from typing import Any, NotRequired
+from typing import Any
+
+try:
+    from typing import NotRequired
+except ImportError:  # Python < 3.11
+    from typing_extensions import NotRequired
 
 import jax
 import jax.extend
@@ -795,10 +800,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
             self.fsdp_is_ep_bound,
             self.sp_is_ep_bound,
         )
-        return self.expert_mesh.abstract_mesh.update(
-            axis_sizes=(odpsize, epsize, otpsize),
-            axis_names=(dpname, epname, tpname),
-        )
+        am = self.expert_mesh.abstract_mesh
+        if hasattr(am, "update"):
+            return am.update(axis_sizes=(odpsize, epsize, otpsize), axis_names=(dpname, epname, tpname))
+        return am
 
     @property
     def auto_expert_mesh(self) -> jax.sharding.Mesh:

@@ -18,6 +18,8 @@ from .binary_classifier_optimization_trainer import BCOConfig, BCOTrainer
 from .contrastive_preference_optimization_trainer import CPOConfig, CPOTrainer
 from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
+from .dflash_config import DFlashConfig
+from .dflash_trainer import DFlashTrainer
 from .generalized_knowledge_distillation_trainer import GKDConfig, GKDTrainer
 from .group_filtered_policy_optimization import GFPOConfig, GFPOTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
@@ -58,6 +60,8 @@ __all__ = (
     "DPOTrainer",
     "DistillationConfig",
     "DistillationTrainer",
+    "DFlashConfig",
+    "DFlashTrainer",
     "GFPOConfig",
     "GFPOTrainer",
     "GKDConfig",

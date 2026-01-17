@@ -93,7 +93,10 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
-            if speculative_config.use_eagle():
+            # eSurge currently uses `use_eagle` as a proxy for "we need auxiliary
+            # hidden-state capture for speculative decoding". DFlash needs the
+            # same capability.
+            if speculative_config.use_eagle() or speculative_config.use_dflash():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
 

@@ -23,7 +23,12 @@ from __future__ import annotations
 
 import os
 import typing as tp
-from typing import Any, Literal, NotRequired, Required, TypedDict
+from typing import Any, Literal
+
+try:
+    from typing import NotRequired, Required, TypedDict
+except ImportError:  # Python < 3.11
+    from typing_extensions import NotRequired, Required, TypedDict
 
 import jax
 from eformer.escale import PartitionAxis

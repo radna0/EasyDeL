@@ -15,7 +15,12 @@ import copy
 from collections import defaultdict
 from dataclasses import dataclass
 from math import prod
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING
+
+try:
+    from typing import Self
+except ImportError:  # Python < 3.11
+    from typing_extensions import Self
 
 from jax import numpy as jnp
 

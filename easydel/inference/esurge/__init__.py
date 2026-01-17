@@ -114,7 +114,10 @@ from .scheduler import (
     SchedulerInterface,
     SchedulerOutput,
 )
-from .server import eSurgeApiServer
+try:  # pragma: no cover
+    from .server import eSurgeApiServer
+except Exception:  # pragma: no cover
+    eSurgeApiServer = None  # type: ignore
 
 __all__ = (
     "AttentionSpec",

@@ -94,8 +94,8 @@ from easydel.layers.caching import (
 )
 
 from ..utils import model_uses_mrope
-from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
-from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor
+from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs, VerifyStepOutputs
+from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor, VerifyStepExecutor
 from .sequence_buffer import SequenceBuffer
 
 DEBUG_MODE = False
@@ -306,6 +306,8 @@ class ExecutionManager:
         max_num_tokens: int | None = None,
         metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None,
         verbose: bool = False,
+        verify_target_layer_ids: list[int] | None = None,
+        verify_add_one_for_pre_layer_capture: bool = True,
     ):
         """Initialize the executor manager.
 
@@ -398,10 +400,29 @@ class ExecutionManager:
             cache_capacity=self._cache_capacity,
             maybe_implicit=self.maybe_implicit,
         )
+        self._verify_executor = VerifyStepExecutor(
+            model=self.model,
+            mesh=self.mesh,
+            metadata=self.metadata,
+            kv_pages_template=self.kv_pages,
+            graphstate_template=self.graphstate,
+            graphother_template=self.graphother,
+            max_num_reqs=self.max_num_reqs,
+            graphdef=self.graphdef,
+            empty_sharding=self._empty_sharding,
+            # TPU stability: Verify-mode is compile-heavy for large-vocab models.
+            # Keep it in JIT-mode even when the main path uses AOT forward.
+            use_aot_forward=False,
+            cache_capacity=max(8, self._cache_capacity // 4),
+            target_layer_ids=verify_target_layer_ids,
+            add_one_for_pre_layer_capture=verify_add_one_for_pre_layer_capture,
+            maybe_implicit=self.maybe_implicit,
+        )
 
     def clear_cache(self):
         self._model_executor.clear_cache()
         self._sampler_executor.clear_cache()
+        self._verify_executor.clear_cache()
         self._debug_baselines.clear()
 
     def update_graphs(
@@ -432,6 +453,7 @@ class ExecutionManager:
             # Keep sub-executors in sync with the active model reference.
             self._model_executor.model = model
             self._sampler_executor.model = model
+            self._verify_executor.model = model
             new_graphdef, new_graphstate, new_graphother = model.split_module()
             graphdef = new_graphdef if graphdef is None else graphdef
             graphstate = new_graphstate if graphstate is None else graphstate
@@ -443,6 +465,7 @@ class ExecutionManager:
         if graphdef is not None:
             self.graphdef = graphdef
             self._model_executor.graphdef = graphdef
+            self._verify_executor.graphdef = graphdef
 
         if graphstate is not None:
             shardings = es.extract_shardings(self.graphstate, self.mesh)
@@ -664,6 +687,100 @@ class ExecutionManager:
             metrics,
         )
 
+    def execute_verify(
+        self,
+        *,
+        num_tokens: int,
+        scheduled_full_cpu: numpy.ndarray,
+        active_mask_full_cpu: numpy.ndarray,
+        input_ids_buf: jax.Array,
+        position_ids_buf: jax.Array,
+        padded_num_reqs: int,
+        token_ids_cpu: numpy.ndarray,
+        num_computed_tokens_cpu: numpy.ndarray,
+        temperature_cpu: numpy.ndarray,
+        top_p_cpu: numpy.ndarray,
+        top_k_cpu: numpy.ndarray,
+        min_p_cpu: numpy.ndarray,
+        page_table_cpu: numpy.ndarray,
+        page_table_version: int | None = None,
+        position_offset_cpu: numpy.ndarray | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, dict[str, float | int]]:
+        """Verify-mode forward: returns per-token logits for the full token window.
+
+        Returns:
+          hidden_states: [num_tokens, hidden_dim]
+          logits:        [num_tokens, vocab_size]
+        """
+
+        start_prep = time.time()
+        (
+            batch_metadata,
+            input_ids_buf,
+            position_ids_buf,
+            scheduled_full,
+            active_mask_full,
+        ) = self.prepare_batch_metadata(
+            num_tokens_static=num_tokens,
+            scheduled_full_cpu=scheduled_full_cpu,
+            active_mask_full_cpu=active_mask_full_cpu,
+            input_ids_buf=input_ids_buf,
+            position_ids_buf=position_ids_buf,
+            token_ids_cpu=token_ids_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            position_offset_cpu=position_offset_cpu,
+            temperature_cpu=temperature_cpu,
+            top_p_cpu=top_p_cpu,
+            top_k_cpu=top_k_cpu,
+            min_p_cpu=min_p_cpu,
+            page_table_cpu=page_table_cpu,
+            page_table_version=page_table_version,
+            padded_num_reqs_in=padded_num_reqs,
+        )
+        prep_took = time.time() - start_prep
+
+        inputs = StepFunctionInputs(
+            kv_pages=self.kv_pages,
+            scheduled_full=scheduled_full,
+            req_num_tokens_full=jax.device_put(jnp.asarray(num_computed_tokens_cpu, dtype=jnp.int32), self._empty_sharding),
+            active_mask_full=active_mask_full,
+            rng_key=self.rng_key,
+            batch_metadata=batch_metadata,
+        )
+
+        verify_mode = "aot" if self._verify_executor.use_aot_forward else "jit"
+        if not self._verify_executor.has((int(num_tokens), int(padded_num_reqs), verify_mode)):
+            if os.environ.get("EASYDEL_VERIFY_DISALLOW_ON_DEMAND_COMPILE", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            ):
+                raise RuntimeError(
+                    "eSurge verify requested an uncompiled token bucket "
+                    f"(num_tokens={int(num_tokens)} padded_num_reqs={int(padded_num_reqs)} mode={verify_mode}). "
+                    "This is disallowed by EASYDEL_VERIFY_DISALLOW_ON_DEMAND_COMPILE=1. "
+                    "Precompile the bucket via ExecutionManager.compile(... num_tokens_paddings=...) "
+                    "or call verify with a fixed compiled bucket and use scheduled_full_cpu for remainders."
+                )
+            # Compile on demand for verify-only paths.
+            self._verify_executor.compile(
+                num_tokens=num_tokens,
+                padded_num_reqs=padded_num_reqs,
+                graphdef=self.graphdef,
+                graphstate=self.graphstate,
+                graphother=self.graphother,
+                inputs=inputs,
+            )
+
+        start_exec = time.time()
+        outputs = self.execute_verify_model(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs, inputs=inputs)
+        exec_took = time.time() - start_exec
+
+        metrics = {"prep_time": prep_took, "exec_time": exec_took, "token_bucket": int(num_tokens), "padded_num_reqs": int(padded_num_reqs)}
+        return outputs.context_features, outputs.greedy_token_ids, input_ids_buf, position_ids_buf, metrics
+
     def execute_model(
         self,
         num_tokens: int,
@@ -676,6 +793,23 @@ class ExecutionManager:
         # Do not block here: allow the caller to pipeline dependent work
         # (e.g. enqueue sampling) before synchronizing.
         outputs = model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
+        self.kv_pages = outputs.kv_pages
+        return outputs
+
+    def execute_verify_model(
+        self,
+        num_tokens: int,
+        padded_num_reqs: int,
+        inputs: StepFunctionInputs,
+    ) -> VerifyStepOutputs:
+        """Run a verify-mode forward step and update `self.kv_pages`.
+
+        This is used by speculative decoding to obtain per-token greedy token IDs
+        over a small verification window.
+        """
+
+        verify_fn = self._verify_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
+        outputs = verify_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
         self.kv_pages = outputs.kv_pages
         return outputs
 
@@ -818,6 +952,22 @@ class ExecutionManager:
                 warm_args = (graphstate, graphother, inputs)
                 self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_model"] = _tree_hash(warm_args)
 
+        # Also precompile verify-mode for the same token buckets.
+        # This avoids JIT-on-demand compilation inside `execute_verify`, which
+        # can be expensive and (on some TPU runtimes) can crash for odd-shaped
+        # remainder buckets.
+        verify_mode = "aot" if self._verify_executor.use_aot_forward else "jit"
+        verify_key = (int(num_tokens), int(padded_num_reqs), verify_mode)
+        if not self._verify_executor.has(verify_key):
+            self._verify_executor.compile(
+                num_tokens=num_tokens,
+                padded_num_reqs=padded_num_reqs,
+                graphdef=graphdef,
+                graphstate=graphstate,
+                graphother=graphother,
+                inputs=inputs,
+            )
+
         sampler_key = (num_tokens, padded_num_reqs, "sampler", mode)
         if not self._sampler_executor.has(sampler_key):
             self._sampler_executor.compile(
@@ -828,11 +978,7 @@ class ExecutionManager:
             )
             if self.use_aot_forward:
                 vocab_size = self.model.config.get_text_config().vocab_size
-                dummy_logits = jnp.zeros(
-                    (padded_num_reqs, vocab_size),
-                    dtype=self.model.dtype,
-                    out_sharding=self._empty_sharding,
-                )
+                dummy_logits = jnp.zeros((padded_num_reqs, vocab_size), dtype=self.model.dtype)
                 sampler_args = (
                     inputs.batch_metadata,
                     inputs.req_num_tokens_full,
@@ -873,6 +1019,7 @@ class ExecutionManager:
         page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
+        position_offset_cpu: numpy.ndarray | None = None,
         # VLM prefill helpers (optional)
         mrope_position_ids_cpu: numpy.ndarray | None = None,
         prefill_embeds_cpu: numpy.ndarray | None = None,
@@ -894,6 +1041,7 @@ class ExecutionManager:
             position_ids_buf=position_ids_buf,
             token_ids_cpu=token_ids_cpu,
             num_computed_tokens_cpu=num_computed_tokens_cpu,
+            position_offset_cpu=position_offset_cpu,
             temperature_cpu=temperature_cpu,
             top_p_cpu=top_p_cpu,
             top_k_cpu=top_k_cpu,
@@ -928,6 +1076,7 @@ class ExecutionManager:
         page_table_cpu: numpy.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
+        position_offset_cpu: numpy.ndarray | None = None,
     ) -> None:
         self._batch_preparer.start_async_prep(
             num_tokens_static=num_tokens_static,
@@ -937,6 +1086,7 @@ class ExecutionManager:
             position_ids_buf=position_ids_buf,
             token_ids_cpu=token_ids_cpu,
             num_computed_tokens_cpu=num_computed_tokens_cpu,
+            position_offset_cpu=position_offset_cpu,
             temperature_cpu=temperature_cpu,
             top_p_cpu=top_p_cpu,
             top_k_cpu=top_k_cpu,

@@ -495,6 +495,7 @@ class Trainer(BaseTrainer):
                 return state, exect, train_iter
 
             # Execute training step
+            run_exception = None
             with self.train_tracker.trace_compilation():
                 with capture_time() as execution_time:
                     state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))

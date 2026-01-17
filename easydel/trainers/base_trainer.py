@@ -222,7 +222,14 @@ class BaseTrainer(BaseTrainerProtocol):
                 logger.warning(f"Resuming from checkpoint failed: {e}. Starting fresh training.")
 
         self.model_state = model_state
-        self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
+        # `flax.nnx.eval_shape` behavior changed across Flax versions; in some
+        # versions returning a Module from `eval_shape` is not supported. We only
+        # need a real model object here (for mesh/lossfn_type/etc.), so fall back
+        # to the reconstructed model if eval_shape fails.
+        try:
+            self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
+        except Exception:
+            self._model = self.model_state.model
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
         self.data_collator = data_collator

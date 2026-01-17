@@ -144,16 +144,35 @@ class SpeculativeConfig:
     """Configuration for speculative decoding.
 
     Attributes:
+        algorithm: Speculative algorithm identifier (e.g., "eagle", "dflash").
         num_speculative_tokens: Number of speculative tokens to generate.
         speculative_model: Path to the speculative model (e.g., Eagle model).
+
+        dflash_block_size: Draft block size B (draft proposes B-1 tokens).
+        dflash_target_layer_ids: Target layer ids used for context features.
     """
 
+    algorithm: str = "eagle"
     num_speculative_tokens: int = 0
     speculative_model: str | None = None
+    dflash_block_size: int = 8
+    dflash_target_layer_ids: tuple[int, ...] | None = None
 
     def use_eagle(self) -> bool:
         """Check if Eagle speculative decoding is enabled."""
-        return self.num_speculative_tokens > 0 and self.speculative_model is not None
+        return (
+            str(self.algorithm).lower() in ("eagle", "eagle3")
+            and self.num_speculative_tokens > 0
+            and self.speculative_model is not None
+        )
+
+    def use_dflash(self) -> bool:
+        """Check if DFlash speculative decoding is enabled."""
+        return (
+            str(self.algorithm).lower() in ("dflash",)
+            and int(self.dflash_block_size) > 1
+            and self.speculative_model is not None
+        )
 
 
 @dataclass

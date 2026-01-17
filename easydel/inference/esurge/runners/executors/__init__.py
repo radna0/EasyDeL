@@ -17,9 +17,11 @@
 from .batch_preparer import BatchMetadataPreparer
 from .model_executor import ModelStepExecutor
 from .sampler_executor import SamplerExecutor
+from .verify_executor import VerifyStepExecutor
 
 __all__ = (
     "BatchMetadataPreparer",
     "ModelStepExecutor",
     "SamplerExecutor",
+    "VerifyStepExecutor",
 )

@@ -71,6 +71,11 @@ class ModelRunnerOutput:
     spec_token_ids: list[list[int]] | None
     logprobs: LogprobsLists | None
     prompt_logprobs_dict: dict[str, LogprobsTensors | None]
+    # Optional: last-layer hidden states for the *scheduled* tokens in this step,
+    # unpacked per request id. Values are host arrays (typically NumPy) to keep
+    # the device step fused. Used by speculative decoding algorithms that need
+    # target hidden features (e.g. DFlash/EAGLE-style).
+    hidden_states_by_req: dict[str, object] | None = None
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
     num_nans_in_logits: dict[str, int] | None = None

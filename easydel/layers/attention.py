@@ -838,7 +838,20 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
                     f"Both left and right window sizes must be >= 0."
                 )
 
-        attn = mask_info.attention_mask.astype(jnp.bool_)  # (B, H, Q, K)
+        # Compatibility: some MaskInfo implementations (or misconfigured call
+        # sites) may not populate attention_mask. Fall back to a basic causal
+        # mask derived from tensor shapes so we can still run correctness-first
+        # workloads (e.g. teacher cache building on TPU).
+        if getattr(mask_info, "attention_mask", None) is None:
+            B = int(key.shape[0])
+            K = int(key.shape[1])
+            Q = int(query_length)
+            row = jnp.arange(Q, dtype=jnp.int32)[:, None]
+            col = jnp.arange(K, dtype=jnp.int32)[None, :]
+            causal = col <= row
+            attn = jnp.broadcast_to(causal[None, None, :, :], (B, 1, Q, K))
+        else:
+            attn = mask_info.attention_mask.astype(jnp.bool_)  # (B, H, Q, K)
         B, _H, Q, K = attn.shape
         if query_length != Q:
             query_length = Q

@@ -283,6 +283,7 @@ class BatchMetadataPreparer:
         page_table_version: int | None,
         padded_num_reqs_in: int,
         copy_slot_mapping: bool,
+        position_offset_cpu: np.ndarray | None = None,
         use_async_buffers: bool = False,
     ) -> tuple[tuple, int, int, int]:
         """Build host payload using preallocated CPU buffers (hot path)."""
@@ -362,7 +363,15 @@ class BatchMetadataPreparer:
                 raise ValueError(
                     f"Request {req_idx} scheduled [{start}:{end}] exceeds token_ids width {token_ids_cpu.shape[1]}."
                 )
-            positions[off : off + n] = start + self._arange_cpu[:n]
+            pos_off = 0
+            if position_offset_cpu is not None:
+                # Most callers pass a vector of per-request offsets, but allow
+                # a scalar-like array for convenience.
+                try:
+                    pos_off = int(position_offset_cpu[req_idx])
+                except Exception:
+                    pos_off = int(position_offset_cpu[0])
+            positions[off : off + n] = start + self._arange_cpu[:n] + np.int32(pos_off)
             input_ids[off : off + n] = token_ids_cpu[req_idx, start:end]
             off += n
 
@@ -493,6 +502,7 @@ class BatchMetadataPreparer:
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
+        position_offset_cpu: np.ndarray | None = None,
         # VLM prefill helpers (optional)
         mrope_position_ids_cpu: np.ndarray | None = None,
         prefill_embeds_cpu: np.ndarray | None = None,
@@ -514,6 +524,7 @@ class BatchMetadataPreparer:
             active_mask_full_cpu=active_mask_full_cpu,
             token_ids_cpu=token_ids_cpu,
             num_computed_tokens_cpu=num_computed_tokens_cpu,
+            position_offset_cpu=position_offset_cpu,
             temperature_cpu=temperature_cpu,
             top_p_cpu=top_p_cpu,
             top_k_cpu=top_k_cpu,
@@ -672,6 +683,7 @@ class BatchMetadataPreparer:
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
+        position_offset_cpu: np.ndarray | None = None,
     ) -> None:
         """Start async device transfer for the next batch (double buffering)."""
         if self._pending_transfer is not None:
@@ -694,6 +706,7 @@ class BatchMetadataPreparer:
             active_mask_full_cpu=self._async_active_mask_full_cpu,
             token_ids_cpu=token_ids_cpu,
             num_computed_tokens_cpu=self._async_num_computed_tokens_cpu,
+            position_offset_cpu=position_offset_cpu,
             temperature_cpu=self._async_temperature_cpu,
             top_p_cpu=self._async_top_p_cpu,
             top_k_cpu=self._async_top_k_cpu,

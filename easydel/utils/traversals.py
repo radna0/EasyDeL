@@ -432,12 +432,28 @@ def recreate_meta_values(values: dict[str, tp.Any], seed: int | None = None) -> 
 
     try:
         for key, value in values.items():
-            if isinstance(type(value), nnx.RngCount | type) and issubclass(type(value), nnx.RngCount):
-                values[key].value = recreator.get_count()
-            elif isinstance(type(value), nnx.RngKey | type) and issubclass(type(value), nnx.RngKey):
-                values[key].value = recreator.get_rng()
+            # Flax NNX metadata can appear as VariableState (newer Flax) or as the
+            # RngCount/RngKey wrapper types (older Flax). Handle both, and ignore
+            # unrelated metadata keys.
+            try:
+                from flax.nnx import variablelib
+            except Exception:  # pragma: no cover
+                variablelib = None  # type: ignore
+
+            if variablelib is not None and isinstance(value, variablelib.VariableState):
+                vtype = getattr(value, "type", None)
+                if isinstance(vtype, type) and issubclass(vtype, nnx.RngCount):
+                    value.value = recreator.get_count()
+                elif isinstance(vtype, type) and issubclass(vtype, nnx.RngKey):
+                    value.value = recreator.get_rng()
+                else:
+                    continue
+            elif isinstance(value, nnx.RngCount):
+                value.value = recreator.get_count()
+            elif isinstance(value, nnx.RngKey):
+                value.value = recreator.get_rng()
             else:
-                raise TypeError(f"Unexpected type {type(value)} for key {key}")
+                continue
     except Exception as e:
         raise ValueError(f"Failed to recreate meta values: {e!s}") from e
 

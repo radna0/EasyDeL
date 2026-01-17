@@ -50,7 +50,10 @@ Example:
 import copy
 from dataclasses import dataclass
 from math import prod
-from typing import Self
+try:
+    from typing import Self
+except ImportError:  # Python < 3.11
+    from typing_extensions import Self
 
 import jax
 
