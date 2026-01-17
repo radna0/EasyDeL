@@ -47,6 +47,86 @@ def _lm_head_logits(*, hidden, lm_head):
     return logits
 
 
+def _tp_greedy_argmax_from_vocab_shard(*, logits_sharded, mesh) -> "jax.Array":
+    """Greedy argmax for vocab-parallel logits on TPU.
+
+    `ColumnParallelLinear` (used for LM heads under TP) returns logits sharded on
+    the vocab dimension across `mesh` axis `tp`. To get global argmax without
+    gathering logits, do:
+      - local argmax + local max
+      - pmax over tp for global max
+      - pmax over tp for global argmax among shards that hit global max
+
+    Returns global token ids (int32) with shape [...], replicated across tp.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from jax.experimental.shard_map import shard_map
+
+    if "tp" not in getattr(mesh, "axis_names", ()):
+        # No TP axis: normal argmax.
+        return jnp.argmax(logits_sharded, axis=-1).astype(jnp.int32)
+
+    tp_size = int(getattr(mesh, "shape", {}).get("tp", 1) or 1)
+    if tp_size <= 1:
+        return jnp.argmax(logits_sharded, axis=-1).astype(jnp.int32)
+
+    def _per_shard_argmax(x_local):
+        x_f = x_local.astype(jnp.float32)
+        local_max = jnp.max(x_f, axis=-1)
+        local_arg = jnp.argmax(x_f, axis=-1).astype(jnp.int32)
+        v_local = int(x_local.shape[-1])
+        tp_idx = jax.lax.axis_index("tp").astype(jnp.int32)
+        arg_global = local_arg + tp_idx * jnp.asarray(v_local, dtype=jnp.int32)
+        global_max = jax.lax.pmax(local_max, "tp")
+        score = jnp.where(local_max == global_max, arg_global, jnp.asarray(-1, dtype=jnp.int32))
+        return jax.lax.pmax(score, "tp").astype(jnp.int32)
+
+    # Assume logits are sharded on the last dim (vocab) by tp.
+    in_specs = P(None, None, "tp") if getattr(logits_sharded, "ndim", 0) == 3 else P(None, "tp")
+    out_specs = P(None, None) if getattr(logits_sharded, "ndim", 0) == 3 else P(None)
+    return shard_map(_per_shard_argmax, mesh=mesh, in_specs=in_specs, out_specs=out_specs)(logits_sharded)
+
+
+def _chunked_argmax_from_lm_head_weight(*, hidden, lm_w, vocab_chunk: int) -> "jax.Array":
+    """Argmax over vocab using frozen LM head weight [V,H], optionally chunked.
+
+    This matches the training-side logic in `DFlashTrainer` and is correct even
+    when `lm_w` is sharded across devices (JAX SPMD will lower reductions).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    hs = hidden.astype(jnp.bfloat16)
+    vocab_size = int(lm_w.shape[0])
+    seq_len = int(hs.shape[1])
+    bsz = int(hs.shape[0])
+
+    if int(vocab_chunk) <= 0 or int(vocab_chunk) >= vocab_size:
+        logits = jnp.einsum("bsh,vh->bsv", hs, lm_w, precision=jax.lax.Precision.HIGHEST)
+        return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+    best_val = jnp.full((bsz, seq_len), -jnp.inf, dtype=jnp.float32)
+    best_ids = jnp.zeros((bsz, seq_len), dtype=jnp.int32)
+    chunk = int(vocab_chunk)
+    for start in range(0, vocab_size, chunk):
+        end = start + chunk
+        w = lm_w[start:end, :]
+        chunk_logits = jnp.einsum(
+            "bsh,vh->bsv",
+            hs,
+            w,
+            precision=jax.lax.Precision.HIGHEST,
+        ).astype(jnp.float32)
+        chunk_best_local = jnp.argmax(chunk_logits, axis=-1).astype(jnp.int32)
+        chunk_best_val = jnp.take_along_axis(chunk_logits, chunk_best_local[..., None], axis=-1)[..., 0]
+        take_chunk = chunk_best_val > best_val
+        best_val = jnp.where(take_chunk, chunk_best_val, best_val)
+        best_ids = jnp.where(take_chunk, chunk_best_local + jnp.int32(start), best_ids)
+    return best_ids.astype(jnp.int32)
+
+
 def load_dflash_draft_from_run_dir(*, run_dir: str | Path, cfg, mesh):
     """Load a DFlashDraftModel + graphstate from an EasyDeL run-* directory."""
     from flax import nnx
@@ -78,6 +158,7 @@ def bench_esurge_dflash_decode_single(
     draft_run_dir: str | Path,
     draft_cfg,
     target_rope,
+    lm_head_weight=None,
     prompt_ids,
     position_offset: int = 0,
     max_new_tokens: int,
@@ -93,6 +174,7 @@ def bench_esurge_dflash_decode_single(
         draft_run_dir=draft_run_dir,
         draft_cfg=draft_cfg,
         target_rope=target_rope,
+        lm_head_weight=lm_head_weight,
         prompt_ids=prompt_ids,
         position_offset=int(position_offset),
         max_new_tokens=max_new_tokens,
@@ -111,6 +193,7 @@ def esurge_dflash_decode_single(
     draft_run_dir: str | Path,
     draft_cfg,
     target_rope,
+    lm_head_weight=None,
     prompt_ids,
     position_offset: int = 0,
     max_new_tokens: int,
@@ -349,6 +432,7 @@ def esurge_dflash_decode_single(
         draft_graphdef, draft_graphstate, draft_graphother = nnx.split(draft, nnx.Param, ...)
         embed_graphdef, embed_graphstate, embed_graphother = nnx.split(embedding_mod, nnx.Param, ...)
         head_graphdef, head_graphstate, head_graphother = nnx.split(lm_head_mod, nnx.Param, ...)
+        lm_w = lm_head_weight
 
         def _draft_propose_ctx_kv(draft_state, embed_state, head_state, ctx_kv_in, cur_id_in):
             cur_id_in = jnp.asarray(cur_id_in, dtype=jnp.int32)
@@ -365,8 +449,13 @@ def esurge_dflash_decode_single(
                 block_size=int(block_size),
             )
             hs_d = d_hidden[:, 1:, :]  # [1, B-1, hidden]
-            d_logits = _lm_head_logits(hidden=hs_d.astype(jnp.bfloat16), lm_head=head_mod)
-            return jnp.argmax(d_logits, axis=-1).astype(jnp.int32)[0]  # [B-1]
+            if lm_w is not None:
+                vocab_chunk = int(os.environ.get("DFLASH_LM_W_CHUNK", "32768"))
+                toks = _chunked_argmax_from_lm_head_weight(hidden=hs_d, lm_w=lm_w, vocab_chunk=vocab_chunk)
+                return toks.astype(jnp.int32)[0]
+            logits_local = head_mod(hs_d.astype(jnp.bfloat16))
+            toks = _tp_greedy_argmax_from_vocab_shard(logits_sharded=logits_local, mesh=mesh)
+            return toks.astype(jnp.int32)[0]  # [B-1]
 
         def _append_ctx_kv(draft_state, ctx_kv_in, ctx_commit_feat_full_in, commit_len_in):
             draft_mod = nnx.merge(draft_graphdef, draft_state, draft_graphother)
@@ -396,8 +485,13 @@ def esurge_dflash_decode_single(
                 ctx_pos_start=ctx_pos_start_in,
             )
             hs_d = d_hidden[:, 1:, :]  # [1, B-1, hidden]
-            d_logits = _lm_head_logits(hidden=hs_d.astype(jnp.bfloat16), lm_head=head_mod)
-            return jnp.argmax(d_logits, axis=-1).astype(jnp.int32)[0]
+            if lm_w is not None:
+                vocab_chunk = int(os.environ.get("DFLASH_LM_W_CHUNK", "32768"))
+                toks = _chunked_argmax_from_lm_head_weight(hidden=hs_d, lm_w=lm_w, vocab_chunk=vocab_chunk)
+                return toks.astype(jnp.int32)[0]
+            logits_local = head_mod(hs_d.astype(jnp.bfloat16))
+            toks = _tp_greedy_argmax_from_vocab_shard(logits_sharded=logits_local, mesh=mesh)
+            return toks.astype(jnp.int32)[0]
 
         def _append_ctx_feat_window(ctx_feat_in, ctx_commit_feat_in):
             ctx_feat_out = jnp.concatenate([ctx_feat_in, ctx_commit_feat_in.astype(jnp.bfloat16)], axis=1)
