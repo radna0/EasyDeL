@@ -279,6 +279,12 @@ def append_draft_ctx_kv_windowed_committed(
 
     # Tail mask: zero out uncommitted KV entries.
     mask = (jnp.arange(block, dtype=jnp.int32) < commit_len_i32)[None, :, None, None]
+    # Prefix mask: after shifting the ctx window by drop_i32, only the first
+    # (start_len - drop_i32) tokens are valid. The dynamic_slice below always
+    # reads a fixed `ctx_window` length, which can include stale data from the
+    # extra "+block" tail region. Mask it out deterministically.
+    old_keep_i32 = jnp.maximum(jnp.asarray(0, dtype=jnp.int32), start_len_i32 - drop_i32)
+    prefix_mask = (jnp.arange(int(ctx_window), dtype=jnp.int32) < old_keep_i32)[None, :, None, None]
 
     k_list = []
     v_list = []
@@ -286,18 +292,21 @@ def append_draft_ctx_kv_windowed_committed(
         k_buf = jnp.asarray(k_old)
         v_buf = jnp.asarray(v_old)
 
-        # Shift the ctx window by `drop_i32` using a fixed-size dynamic slice:
-        # the buffers are sized to `ctx_window + block`, so drop_i32+ctx_window stays in-bounds.
+        # Shift the ctx window by `drop_i32` using a fixed-size dynamic slice.
+        # IMPORTANT: We must not leak stale values from the "+block" tail
+        # region into the logical ctx window. Always mask the shifted prefix so
+        # only the first (start_len - drop_i32) tokens remain valid before we
+        # write the newly committed tokens.
         k_shift = jax.lax.dynamic_slice(
             k_buf,
             (0, drop_i32, 0, 0),
             (k_buf.shape[0], int(ctx_window), k_buf.shape[2], k_buf.shape[3]),
-        )
+        ) * prefix_mask
         v_shift = jax.lax.dynamic_slice(
             v_buf,
             (0, drop_i32, 0, 0),
             (v_buf.shape[0], int(ctx_window), v_buf.shape[2], v_buf.shape[3]),
-        )
+        ) * prefix_mask
         k_buf = k_buf.at[:, : int(ctx_window), :, :].set(k_shift)
         v_buf = v_buf.at[:, : int(ctx_window), :, :].set(v_shift)
 

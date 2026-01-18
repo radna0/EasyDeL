@@ -529,6 +529,7 @@ def esurge_dflash_decode_single(
     log_every_blocks = int(os.environ.get("DFLASH_LOG_EVERY_BLOCKS", "0"))
     debug_tokens = os.environ.get("DFLASH_DEBUG_TOKENS", "0").lower() in ("1", "true", "yes", "y", "on")
     debug_tokens_blocks = int(os.environ.get("DFLASH_DEBUG_TOKENS_BLOCKS", "1"))
+    rollback_recompute = os.environ.get("DFLASH_VERIFY_ROLLBACK_RECOMPUTE", "0").lower() in ("1", "true", "yes", "y", "on")
 
     # ---- DFlash decode (verify blocks) ----
     t0 = time.time()
@@ -566,6 +567,7 @@ def esurge_dflash_decode_single(
         seqbuf.num_tokens_no_spec[0] = int(base_len + int(block_size))
 
         scheduled_full_cpu[0] = int(block_size)
+        kv_before = executor.kv_pages
         ctx_part, greedy_ids, input_ids_buf, position_ids_buf, _m = executor.execute_verify(
             num_tokens=int(block_size),
             scheduled_full_cpu=scheduled_full_cpu,
@@ -591,6 +593,41 @@ def esurge_dflash_decode_single(
         accept_lens.append(int(n_acc))
         keep = 1 + n_acc
 
+        # Critical correctness fix (optional): if we don't accept the full draft
+        # block, we must NOT leave unaccepted tokens' KV in the target cache.
+        #
+        # In SGLang DFlash, this is handled by verify-mode cache commit/rollback.
+        # EasyDeL's eSurge verify currently always mutates KV for the entire
+        # `block_size` window, so we provide a correctness-first fallback:
+        #   - rollback KV to pre-verify state
+        #   - re-run verify on only the committed prefix (`keep` tokens)
+        # This makes the target cache identical to baseline greedy, at the cost
+        # of extra work only when keep < block_size.
+        ctx_part_used = ctx_part
+        if bool(rollback_recompute) and int(keep) < int(block_size):
+            executor.kv_pages = kv_before
+            seqbuf.num_tokens[0] = int(base_len + int(keep))
+            seqbuf.num_tokens_no_spec[0] = int(base_len + int(keep))
+            scheduled_full_cpu[0] = int(keep)
+            ctx_part_used, _greedy_unused, input_ids_buf, position_ids_buf, _m2 = executor.execute_verify(
+                num_tokens=int(block_size),
+                scheduled_full_cpu=scheduled_full_cpu,
+                active_mask_full_cpu=active_mask_full_cpu,
+                input_ids_buf=input_ids_buf,
+                position_ids_buf=position_ids_buf,
+                padded_num_reqs=1,
+                token_ids_cpu=seqbuf.token_ids,
+                num_computed_tokens_cpu=seqbuf.num_computed_tokens,
+                position_offset_cpu=pos_off_cpu,
+                temperature_cpu=seqbuf.temperature,
+                top_p_cpu=seqbuf.top_p,
+                top_k_cpu=seqbuf.top_k,
+                min_p_cpu=seqbuf.min_p,
+                page_table_cpu=page_table_cpu,
+                page_table_version=page_table_version,
+            )
+            scheduled_full_cpu[0] = int(block_size)
+
         if bool(debug_tokens) and int(len(accept_lens)) <= int(debug_tokens_blocks):
             try:
                 cand_cpu = np.asarray(cand, dtype=np.int32).tolist()
@@ -608,7 +645,7 @@ def esurge_dflash_decode_single(
 
         # Append committed tokens' ctx features so drafting conditions on what was actually verified.
         ctx_commit_feat_full = (
-            jnp.asarray(ctx_part)[: int(block_size), :].reshape((1, int(block_size), -1)).astype(jnp.bfloat16)
+            jnp.asarray(ctx_part_used)[: int(block_size), :].reshape((1, int(block_size), -1)).astype(jnp.bfloat16)
         )
         with mesh:
             if draft_mode == "ctx_kv":
@@ -650,7 +687,11 @@ def esurge_dflash_decode_single(
             kv_ctx_len = "n/a"
             if draft_mode == "ctx_kv" and ctx_kv is not None:
                 try:
-                    kv_pos_start = str(int(np.asarray(jax.device_get(ctx_kv.pos_start))[0]))
+                    pos = np.asarray(jax.device_get(ctx_kv.pos_start))
+                    if getattr(pos, "ndim", 0) == 0:
+                        kv_pos_start = str(int(pos))
+                    else:
+                        kv_pos_start = str(int(pos.reshape((-1,))[0]))
                     kv_ctx_len = str(int(np.asarray(jax.device_get(ctx_kv.ctx_len))))
                 except Exception:
                     kv_pos_start = "err"
