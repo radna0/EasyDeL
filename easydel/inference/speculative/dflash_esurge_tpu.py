@@ -432,7 +432,18 @@ def esurge_dflash_decode_single(
         draft_graphdef, draft_graphstate, draft_graphother = nnx.split(draft, nnx.Param, ...)
         embed_graphdef, embed_graphstate, embed_graphother = nnx.split(embedding_mod, nnx.Param, ...)
         head_graphdef, head_graphstate, head_graphother = nnx.split(lm_head_mod, nnx.Param, ...)
-        lm_w = lm_head_weight
+        # NOTE:
+        # For TPU throughput and correctness, we prefer using the target model's
+        # LM head Module (which already handles TP sharding) over capturing a
+        # raw `lm_head_weight` array in a jitted function. Closed-over sharded
+        # arrays can be treated as XLA constants under `jax.jit`, which can
+        # silently reshard/replicate and produce wrong argmax tokens (collapsing
+        # accept_len).
+        #
+        # `DFLASH_DRAFT_USE_LM_W=1` is therefore only supported in *non-jitted*
+        # draft mode (DFLASH_JIT_DRAFT=0) for debugging / parity checks.
+        use_lm_w = os.environ.get("DFLASH_DRAFT_USE_LM_W", "0").lower() in ("1", "true", "yes", "y", "on")
+        lm_w = lm_head_weight if bool(use_lm_w) else None
 
         def _draft_propose_ctx_kv(draft_state, embed_state, head_state, ctx_kv_in, cur_id_in):
             cur_id_in = jnp.asarray(cur_id_in, dtype=jnp.int32)
@@ -504,6 +515,14 @@ def esurge_dflash_decode_single(
         # verify executables to fail loading (RESOURCE_EXHAUSTED). Allow
         # disabling JIT for debugging correctness and accept_len behavior.
         jit_draft = os.environ.get("DFLASH_JIT_DRAFT", "1").lower() in ("1", "true", "yes", "y", "on")
+        if bool(jit_draft) and lm_w is not None:
+            # Never allow a raw LM-head weight capture under jit; see note above.
+            if jax.process_index() == 0:
+                print(
+                    "[dflash] disabling DFLASH_DRAFT_USE_LM_W under jit to avoid constant capture",
+                    flush=True,
+                )
+            lm_w = None
 
         if bool(jit_draft):
             # Let JAX preserve existing parameter shardings for draft/embedding/lm_head

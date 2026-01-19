@@ -215,9 +215,21 @@ def _chunked_ce_nll_and_acc(
     best_ids = jnp.zeros((bsz, seq_len), dtype=jnp.int32)
 
     chunk = int(vocab_chunk)
-    for start in range(0, vocab_size, chunk):
-        end = start + chunk
-        w = lm_w[start:end, :]
+    # IMPORTANT: avoid a Python `for` loop here. If we unroll 16+ chunks at
+    # compile-time, XLA compilation can become huge/unstable on TPU and the
+    # process may get killed without a Python traceback. Use `lax.scan` to keep
+    # the HLO small and compilation predictable.
+    if vocab_size % chunk != 0:
+        raise ValueError(f"vocab_size={vocab_size} must be divisible by vocab_chunk={chunk}")
+    n_chunks = vocab_size // chunk
+    lm_w_chunks = lm_w.reshape((n_chunks, chunk, int(lm_w.shape[1])))
+    starts = (jnp.arange(n_chunks, dtype=jnp.int32) * jnp.int32(chunk)).reshape((n_chunks,))
+
+    def _scan_body(carry, xs):
+        running_max, running_sumexp, gold_logits, best_val, best_ids = carry
+        w, start = xs  # w: [chunk,H], start: scalar int32
+        end = start + jnp.int32(chunk)
+
         chunk_logits = jnp.einsum(
             "bsh,vh->bsv",
             hs_f,
@@ -240,7 +252,15 @@ def _chunked_ce_nll_and_acc(
         chunk_best_val = jnp.take_along_axis(chunk_logits, chunk_best_local[..., None], axis=-1)[..., 0]
         take_chunk = chunk_best_val > best_val
         best_val = jnp.where(take_chunk, chunk_best_val, best_val)
-        best_ids = jnp.where(take_chunk, chunk_best_local + jnp.int32(start), best_ids)
+        best_ids = jnp.where(take_chunk, chunk_best_local + start, best_ids)
+
+        return (running_max, running_sumexp, gold_logits, best_val, best_ids), None
+
+    (running_max, running_sumexp, gold_logits, best_val, best_ids), _ = jax.lax.scan(
+        _scan_body,
+        (running_max, running_sumexp, gold_logits, best_val, best_ids),
+        (lm_w_chunks, starts),
+    )
 
     logz = running_max + jnp.log(running_sumexp + 1e-9)
     nll = logz - gold_logits
