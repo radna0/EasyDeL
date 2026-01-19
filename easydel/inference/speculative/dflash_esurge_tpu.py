@@ -384,10 +384,25 @@ def esurge_dflash_decode_single(
         ctx_hidden = draft.project_context_features(ctx_feat)
         ctx_kv = None
         ctx_feat_win = ctx_feat
-        # By default, keep a fixed-size window equal to the prompt prefix length.
-        # For cache-parity training runs, prompt_len == ctx_len + 1 so this matches.
-        ctx_window = int(os.environ.get("DFLASH_CTX_WINDOW", str(int(ctx_feat.shape[1]))))
-        ctx_window = max(0, min(int(ctx_feat.shape[1]), int(ctx_window)))
+        # Draft conditioning window (number of prefix tokens' context-features).
+        #
+        # IMPORTANT:
+        # - If we clamp this to the *initial* prefill length, then during decode
+        #   the draft will start dropping old tokens once we generate enough
+        #   new tokens, while the target model still conditions on the full KV
+        #   history. That distribution mismatch collapses accept_len after the
+        #   first few blocks (it looks like "DFLASH stops working after N
+        #   tokens").
+        # - For a fair DFLASH decode benchmark, the draft and target must see
+        #   the same effective context. The simplest correctness-first choice
+        #   is to let the draft window grow up to the decode horizon.
+        #
+        # Default: keep the same fixed ctx length the cache/training used
+        # (i.e. the prefill prefix length). For longer decode horizons, bump
+        # `DFLASH_CTX_WINDOW` and rebuild/train with a larger cache ctx_len.
+        default_ctx_window = int(ctx_feat.shape[1])
+        ctx_window = int(os.environ.get("DFLASH_CTX_WINDOW", str(int(default_ctx_window))))
+        ctx_window = max(0, int(ctx_window))
         if draft_mode == "direct_window":
             ctx_feat_win = ctx_feat[:, -ctx_window:, :]
             ctx_feat_win = jax.device_put(ctx_feat_win, empty_sharding)
@@ -704,6 +719,7 @@ def esurge_dflash_decode_single(
         if log_every_blocks > 0 and (len(accept_lens) % int(log_every_blocks) == 0):
             kv_pos_start = "n/a"
             kv_ctx_len = "n/a"
+            win_len = "n/a"
             if draft_mode == "ctx_kv" and ctx_kv is not None:
                 try:
                     pos = np.asarray(jax.device_get(ctx_kv.pos_start))
@@ -715,6 +731,11 @@ def esurge_dflash_decode_single(
                 except Exception:
                     kv_pos_start = "err"
                     kv_ctx_len = "err"
+            else:
+                try:
+                    win_len = str(int(ctx_feat_win.shape[1]))
+                except Exception:
+                    win_len = "err"
             print(
                 "[dflash] "
                 f"block={len(accept_lens)} "
@@ -722,6 +743,7 @@ def esurge_dflash_decode_single(
                 f"keep={keep} "
                 f"accept_len={n_acc} "
                 f"ctx_pos_start_win={ctx_pos_start_win if draft_mode!='ctx_kv' else 'n/a'} "
+                f"ctx_win_len={win_len if draft_mode!='ctx_kv' else 'n/a'} "
                 f"ctx_kv_pos_start={kv_pos_start} "
                 f"ctx_kv_len={kv_ctx_len}",
                 flush=True,
