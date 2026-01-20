@@ -60,11 +60,28 @@ def load_dflash_graphstate_from_run(
     This is intentionally lightweight and does not require TrainerArguments.
     """
 
+    import pickle
+
+    import jax
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
     from eformer.serialization.checkpointer import Checkpointer
 
     run_path = Path(run_dir).expanduser().resolve()
     if not run_path.is_dir():
         raise FileNotFoundError(f"Missing run_dir: {run_path}")
+
+    # Multi-host TPU checkpoints (produced by DFlashTrainer) are stored as a
+    # simple replicated graphstate pickle to avoid JAX multiprocess
+    # serialization restrictions.
+    ckpt_pkl = run_path / "model" / "graphstate.pkl"
+    if ckpt_pkl.exists():
+        graphstate_host = pickle.loads(ckpt_pkl.read_bytes())
+        empty = NamedSharding(mesh, P())
+        graphstate_sh = jax.tree_util.tree_map(lambda _: empty, graphstate_host)
+        with mesh:
+            return jax.device_put(graphstate_host, graphstate_sh)
 
     ckpt = Checkpointer(base_path=str(run_path), save_interval=None, step_policies=[])
     with mesh:

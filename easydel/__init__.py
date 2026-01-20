@@ -96,20 +96,27 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_gpu_enable_command_buffer='' "
         "--xla_disable_hlo_passes=collective-permute-motion "
     )
+    # NOTE: TPU XLA flag availability varies by runtime/libtpu version. Bad
+    # flags hard-crash the process at startup, so keep the riskiest ones opt-in.
+    _tpu_latency_hiding_flag = ""
+    if _os.getenv("EASYDEL_ENABLE_TPU_LATENCY_HIDING", "0").lower() in ("1", "true", "yes", "y", "on"):
+        _tpu_latency_hiding_flag = "--xla_tpu_enable_latency_hiding_scheduler=true "
+
     _os.environ["LIBTPU_INIT_ARGS"] = (
-        _os.getenv("LIBTPU_INIT_ARGS", "") + " "
-        "--xla_tpu_enable_latency_hiding_scheduler=true "
-        "--xla_enable_async_collective_permute=true "
-        "--xla_tpu_enable_ag_backward_pipelining=true "
-        "--xla_tpu_enable_data_parallel_all_reduce_opt=true "
-        "--xla_tpu_data_parallel_opt_different_sized_ops=true "
-        "--xla_tpu_enable_async_collective_fusion=true "
-        "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
-        "--xla_tpu_overlap_compute_collective_tc=true "
-        "--xla_enable_async_all_gather=true "
-        "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
-        "--xla_tpu_megacore_fusion_allow_ags=false "
-        "TPU_MEGACORE=MEGACORE_DENSE "
+        _os.getenv("LIBTPU_INIT_ARGS", "")
+        + " "
+        + _tpu_latency_hiding_flag
+        + "--xla_enable_async_collective_permute=true "
+        + "--xla_tpu_enable_ag_backward_pipelining=true "
+        + "--xla_tpu_enable_data_parallel_all_reduce_opt=true "
+        + "--xla_tpu_data_parallel_opt_different_sized_ops=true "
+        + "--xla_tpu_enable_async_collective_fusion=true "
+        + "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
+        + "--xla_tpu_overlap_compute_collective_tc=true "
+        + "--xla_enable_async_all_gather=true "
+        + "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
+        + "--xla_tpu_megacore_fusion_allow_ags=false "
+        + "TPU_MEGACORE=MEGACORE_DENSE "
     )
     _os.environ.update(
         {

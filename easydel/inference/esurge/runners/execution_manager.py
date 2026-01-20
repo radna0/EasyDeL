@@ -936,6 +936,23 @@ class ExecutionManager:
         graphdef, graphstate, graphother, inputs = compargs
 
         mode = "aot" if self.use_aot_forward else "jit"
+        # Precompile verify-mode for the same token buckets.
+        #
+        # IMPORTANT (JIT mode): the normal model-step donates `kv_pages`, so
+        # calling the model-step wrapper during compilation can invalidate the
+        # KV template before we compile verify-mode. Compile verify first.
+        verify_mode = "aot" if self._verify_executor.use_aot_forward else "jit"
+        verify_key = (int(num_tokens), int(padded_num_reqs), verify_mode)
+        if not self._verify_executor.has(verify_key):
+            self._verify_executor.compile(
+                num_tokens=num_tokens,
+                padded_num_reqs=padded_num_reqs,
+                graphdef=graphdef,
+                graphstate=graphstate,
+                graphother=graphother,
+                inputs=inputs,
+            )
+
         model_key = (num_tokens, padded_num_reqs, "model", mode)
         if not self._model_executor.has(model_key):
             model_out = self._model_executor.compile(
@@ -951,22 +968,6 @@ class ExecutionManager:
             if self.use_aot_forward:
                 warm_args = (graphstate, graphother, inputs)
                 self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_model"] = _tree_hash(warm_args)
-
-        # Also precompile verify-mode for the same token buckets.
-        # This avoids JIT-on-demand compilation inside `execute_verify`, which
-        # can be expensive and (on some TPU runtimes) can crash for odd-shaped
-        # remainder buckets.
-        verify_mode = "aot" if self._verify_executor.use_aot_forward else "jit"
-        verify_key = (int(num_tokens), int(padded_num_reqs), verify_mode)
-        if not self._verify_executor.has(verify_key):
-            self._verify_executor.compile(
-                num_tokens=num_tokens,
-                padded_num_reqs=padded_num_reqs,
-                graphdef=graphdef,
-                graphstate=graphstate,
-                graphother=graphother,
-                inputs=inputs,
-            )
 
         sampler_key = (num_tokens, padded_num_reqs, "sampler", mode)
         if not self._sampler_executor.has(sampler_key):

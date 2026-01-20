@@ -177,7 +177,16 @@ class ModelStepExecutor:
 
         @ejit(
             static_argnums=(0,),
-            donate_argnames=["kv_pages"],
+            # Donation is great for steady-state decoding throughput, but during
+            # compile-time warmups we often re-use the same KV template buffers
+            # across multiple executors (model step + verify step). Donating KV
+            # here can delete the template buffer and make subsequent compile
+            # calls fail with "Array has been deleted".
+            #
+            # For stability (especially on TPU + speculative workflows), keep
+            # the model executor non-donating; the runtime can still donate on
+            # a separate steady-state path if/when needed.
+            donate_argnames=[],
             in_shardings=(
                 es.extract_shardings(graphstate_template, self.mesh),
                 es.extract_shardings(graphother_template, self.mesh),

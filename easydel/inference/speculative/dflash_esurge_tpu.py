@@ -301,6 +301,14 @@ def esurge_dflash_decode_single(
     prompt_len = int(prompt_ids.size)
     total_prefill = int(prompt_len - 1)  # exclude current token (SGLang-style)
     prefill_chunk = int(max(1, int(os.environ.get("DFLASH_PREFILL_CHUNK", "256"))))
+    verify_bucket_env = os.environ.get("DFLASH_VERIFY_BUCKET", "").strip()
+    verify_bucket = int(block_size)
+    if verify_bucket_env:
+        try:
+            verify_bucket = int(verify_bucket_env)
+        except Exception:
+            verify_bucket = int(block_size)
+    verify_bucket = int(max(1, min(int(verify_bucket), int(block_size))))
     # IMPORTANT (TPU stability): keep verify buckets fixed.
     # Passing `num_tokens=<remainder>` triggers on-demand compilation of a new
     # token bucket (e.g. 255), which can segfault in XLA/jellyfish when
@@ -309,7 +317,7 @@ def esurge_dflash_decode_single(
     # (possibly smaller) work.
     prefill_bucket = int(min(int(prefill_chunk), int(max_model_len)))
     executor.compile(
-        num_tokens_paddings=sorted({1, int(block_size), int(max(1, prefill_bucket))}),
+        num_tokens_paddings=sorted({1, int(verify_bucket), int(max(1, prefill_bucket))}),
         num_reqs_max_model_len=1,
         max_pages_per_req=int(metadata.max_num_pages_per_req),
         max_num_reqs=1,
@@ -563,7 +571,23 @@ def esurge_dflash_decode_single(
     log_every_blocks = int(os.environ.get("DFLASH_LOG_EVERY_BLOCKS", "0"))
     debug_tokens = os.environ.get("DFLASH_DEBUG_TOKENS", "0").lower() in ("1", "true", "yes", "y", "on")
     debug_tokens_blocks = int(os.environ.get("DFLASH_DEBUG_TOKENS_BLOCKS", "1"))
-    rollback_recompute = os.environ.get("DFLASH_VERIFY_ROLLBACK_RECOMPUTE", "0").lower() in ("1", "true", "yes", "y", "on")
+    # Correctness-first default: eSurge verify mutates the target KV for the full
+    # `block_size` window. If we only accept a prefix, leaving the unaccepted
+    # tokens' KV in the cache corrupts future decoding and collapses accept_len.
+    #
+    # Until eSurge supports true KV commit/rollback, default to rollback+recompute
+    # on the committed prefix when keep < block_size.
+    rollback_recompute = os.environ.get("DFLASH_VERIFY_ROLLBACK_RECOMPUTE", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    if int(verify_bucket) != int(block_size):
+        # Sequential verification (verify_bucket < block_size) never mutates KV
+        # for unaccepted tokens, so rollback+recompute is unnecessary.
+        rollback_recompute = False
 
     # ---- DFlash decode (verify blocks) ----
     t0 = time.time()
@@ -600,32 +624,117 @@ def esurge_dflash_decode_single(
         seqbuf.num_tokens[0] = int(base_len + int(block_size))
         seqbuf.num_tokens_no_spec[0] = int(base_len + int(block_size))
 
-        scheduled_full_cpu[0] = int(block_size)
-        kv_before = executor.kv_pages
-        ctx_part, greedy_ids, input_ids_buf, position_ids_buf, _m = executor.execute_verify(
-            num_tokens=int(block_size),
-            scheduled_full_cpu=scheduled_full_cpu,
-            active_mask_full_cpu=active_mask_full_cpu,
-            input_ids_buf=input_ids_buf,
-            position_ids_buf=position_ids_buf,
-            padded_num_reqs=1,
-            token_ids_cpu=seqbuf.token_ids,
-            num_computed_tokens_cpu=seqbuf.num_computed_tokens,
-            position_offset_cpu=pos_off_cpu,
-            temperature_cpu=seqbuf.temperature,
-            top_p_cpu=seqbuf.top_p,
-            top_k_cpu=seqbuf.top_k,
-            min_p_cpu=seqbuf.min_p,
-            page_table_cpu=page_table_cpu,
-            page_table_version=page_table_version,
-        )
-        greedy_ids = jnp.asarray(greedy_ids)[None, :]  # [1,B]
-        cand_j = jnp.asarray(cand[None, :], dtype=jnp.int32)  # [1,B]
+        def _verify_block_in_chunks() -> tuple[int, int, "jax.Array", "jax.Array", "jax.Array"]:
+            # Verify candidates in fixed-size buckets (for TPU compiler stability).
+            # When verify_bucket < block_size, this becomes sequential verification
+            # of the block and avoids compiling the full block_size token path.
+            import jax
 
-        accept_len, bonus = dflash_accept_len_and_bonus(candidates=cand_j, target_predict=greedy_ids)
-        n_acc = int(jnp.asarray(accept_len)[0])
-        accept_lens.append(int(n_acc))
-        keep = 1 + n_acc
+            greedy_list: list[int] = []
+            ctx_parts_local: list["jax.Array"] = []
+            input_ids_buf_local = input_ids_buf
+            position_ids_buf_local = position_ids_buf
+
+            accept_len_local = 0
+            bonus_local = None
+
+            pos = 0
+            # Keep track of "base" num_computed_tokens as we advance.
+            while pos < int(block_size):
+                seg_len = int(min(int(verify_bucket), int(block_size) - pos))
+                # We always call the precompiled bucket size, but schedule only seg_len tokens.
+                seqbuf.num_computed_tokens[0] = int(base_len + pos)
+                scheduled_full_cpu[0] = int(seg_len)
+                # Ensure the sequence length covers the bucket padding.
+                seqbuf.num_tokens[0] = int(base_len + pos + int(verify_bucket))
+                seqbuf.num_tokens_no_spec[0] = int(base_len + pos + int(verify_bucket))
+                ctx_part_seg, greedy_seg, input_ids_buf_out, position_ids_buf_out, _m_seg = executor.execute_verify(
+                    num_tokens=int(verify_bucket),
+                    scheduled_full_cpu=scheduled_full_cpu,
+                    active_mask_full_cpu=active_mask_full_cpu,
+                    input_ids_buf=input_ids_buf_local,
+                    position_ids_buf=position_ids_buf_local,
+                    padded_num_reqs=1,
+                    token_ids_cpu=seqbuf.token_ids,
+                    num_computed_tokens_cpu=seqbuf.num_computed_tokens,
+                    position_offset_cpu=pos_off_cpu,
+                    temperature_cpu=seqbuf.temperature,
+                    top_p_cpu=seqbuf.top_p,
+                    top_k_cpu=seqbuf.top_k,
+                    min_p_cpu=seqbuf.min_p,
+                    page_table_cpu=page_table_cpu,
+                    page_table_version=page_table_version,
+                )
+                # propagate buffers
+                input_ids_buf_local = input_ids_buf_out
+                position_ids_buf_local = position_ids_buf_out
+
+                greedy_seg_cpu = np.asarray(jax.device_get(greedy_seg), dtype=np.int32)[:seg_len].tolist()
+                greedy_list.extend([int(x) for x in greedy_seg_cpu])
+                ctx_parts_local.append(jnp.asarray(ctx_part_seg)[:seg_len, :])
+
+                # Incremental accept_len/bonus computation.
+                # We need greedy predictions for positions 0..accept_len at least.
+                # Compare cand[pos+i] (i>=1) vs greedy[pos+i-1].
+                start_idx = max(1, pos)
+                end_idx = pos + seg_len
+                for t in range(start_idx, end_idx):
+                    if int(cand[t]) != int(greedy_list[t - 1]):
+                        accept_len_local = int(t - 1)
+                        bonus_local = int(greedy_list[t - 1])
+                        # Stop further verification; KV already covers tokens up to t-1.
+                        pos = int(block_size)
+                        break
+                else:
+                    pos += seg_len
+                    continue
+                break
+
+            if bonus_local is None:
+                # Either all draft tokens accepted, or mismatch at the very end; in both cases
+                # bonus token is greedy[accept_len].
+                accept_len_local = int(min(int(block_size) - 1, len(greedy_list) - 1))
+                bonus_local = int(greedy_list[accept_len_local])
+
+            # Concatenate ctx parts for committed prefix.
+            ctx_all = jnp.concatenate(ctx_parts_local, axis=0) if ctx_parts_local else jnp.zeros((0, 0), dtype=jnp.bfloat16)
+            return int(accept_len_local), int(bonus_local), ctx_all, input_ids_buf_local, position_ids_buf_local
+
+        if int(verify_bucket) == int(block_size):
+            scheduled_full_cpu[0] = int(block_size)
+            kv_before = executor.kv_pages
+            ctx_part, greedy_ids, input_ids_buf, position_ids_buf, _m = executor.execute_verify(
+                num_tokens=int(block_size),
+                scheduled_full_cpu=scheduled_full_cpu,
+                active_mask_full_cpu=active_mask_full_cpu,
+                input_ids_buf=input_ids_buf,
+                position_ids_buf=position_ids_buf,
+                padded_num_reqs=1,
+                token_ids_cpu=seqbuf.token_ids,
+                num_computed_tokens_cpu=seqbuf.num_computed_tokens,
+                position_offset_cpu=pos_off_cpu,
+                temperature_cpu=seqbuf.temperature,
+                top_p_cpu=seqbuf.top_p,
+                top_k_cpu=seqbuf.top_k,
+                min_p_cpu=seqbuf.min_p,
+                page_table_cpu=page_table_cpu,
+                page_table_version=page_table_version,
+            )
+            greedy_ids = jnp.asarray(greedy_ids)[None, :]  # [1,B]
+            cand_j = jnp.asarray(cand[None, :], dtype=jnp.int32)  # [1,B]
+
+            accept_len, bonus = dflash_accept_len_and_bonus(candidates=cand_j, target_predict=greedy_ids)
+            n_acc = int(jnp.asarray(accept_len)[0])
+            accept_lens.append(int(n_acc))
+            keep = 1 + n_acc
+            ctx_part_used = ctx_part
+        else:
+            # v5p stability fallback: avoid compiling the multi-token verify bucket.
+            n_acc, bonus_int, ctx_part_used, input_ids_buf, position_ids_buf = _verify_block_in_chunks()
+            accept_lens.append(int(n_acc))
+            keep = 1 + int(n_acc)
+            bonus = jnp.asarray([np.int32(int(bonus_int))], dtype=jnp.int32)
+            kv_before = None  # unused in this path
 
         # Critical correctness fix (optional): if we don't accept the full draft
         # block, we must NOT leave unaccepted tokens' KV in the target cache.
@@ -637,7 +746,6 @@ def esurge_dflash_decode_single(
         #   - re-run verify on only the committed prefix (`keep` tokens)
         # This makes the target cache identical to baseline greedy, at the cost
         # of extra work only when keep < block_size.
-        ctx_part_used = ctx_part
         if bool(rollback_recompute) and int(keep) < int(block_size):
             executor.kv_pages = kv_before
             seqbuf.num_tokens[0] = int(base_len + int(keep))
@@ -665,7 +773,15 @@ def esurge_dflash_decode_single(
         if bool(debug_tokens) and int(len(accept_lens)) <= int(debug_tokens_blocks):
             try:
                 cand_cpu = np.asarray(cand, dtype=np.int32).tolist()
-                greedy_cpu = np.asarray(jax.device_get(greedy_ids[0]), dtype=np.int32).tolist()
+                # `greedy_ids` exists only in the single-call verify path. In the
+                # chunked verify path we build `greedy_list` inside
+                # `_verify_block_in_chunks` and return `bonus_int`; fall back to
+                # printing that partial greedy list instead of crashing.
+                if "greedy_ids" in locals():
+                    greedy_arr = greedy_ids[0]
+                else:
+                    greedy_arr = jnp.asarray(greedy_list, dtype=jnp.int32)
+                greedy_cpu = np.asarray(jax.device_get(greedy_arr), dtype=np.int32).tolist()
                 matches_cpu = [int(a == b) for a, b in zip(cand_cpu[1:], greedy_cpu[:-1])]
                 print(
                     "[dflash][debug] "
@@ -678,8 +794,13 @@ def esurge_dflash_decode_single(
                 print(f"[dflash][debug] token dump failed: {type(e).__name__}: {e}", flush=True)
 
         # Append committed tokens' ctx features so drafting conditions on what was actually verified.
-        ctx_commit_feat_full = (
-            jnp.asarray(ctx_part_used)[: int(block_size), :].reshape((1, int(block_size), -1)).astype(jnp.bfloat16)
+        # Keep fixed [1, block_size, K*H] shape for JIT stability; only the first
+        # `keep` tokens are meaningful when verify_bucket < block_size.
+        ctx_part_used = jnp.asarray(ctx_part_used)
+        feat_dim = int(ctx_part_used.shape[-1]) if getattr(ctx_part_used, "ndim", 0) >= 2 else 0
+        ctx_commit_feat_full = jnp.zeros((1, int(block_size), int(feat_dim)), dtype=jnp.bfloat16)
+        ctx_commit_feat_full = ctx_commit_feat_full.at[0, : int(min(int(keep), ctx_part_used.shape[0])), :].set(
+            ctx_part_used[: int(min(int(keep), ctx_part_used.shape[0])), :].astype(jnp.bfloat16)
         )
         with mesh:
             if draft_mode == "ctx_kv":
@@ -766,7 +887,9 @@ def esurge_dflash_decode_single(
         accept_len_mean=accept_len_mean,
         accept_len_p50=accept_len_p50,
         accept_len_p90=accept_len_p90,
-        draft_mask_rate=0.0,
+        # Draft always uses mask embeddings for the (block_size-1) unverified
+        # positions in spec-v1.
+        draft_mask_rate=1.0,
     )
 
     if not bool(also_run_baseline):
@@ -778,6 +901,7 @@ def esurge_dflash_decode_single(
         )
 
     # ---- Baseline greedy (verify-mode, 1 token step) ----
+    baseline_bucket = 1
     executor = ExecutionManager(
         model=teacher.esurge_compatible_model,
         use_aot_forward=True,
@@ -791,9 +915,8 @@ def esurge_dflash_decode_single(
         verify_add_one_for_pre_layer_capture=bool(getattr(draft_cfg, "add_one_for_pre_layer_capture", True)),
     )
     executor.compile(
-        # Include `block_size` so baseline decode can reuse the same fixed token
-        # bucket as DFlash verify (keeps outputs comparable on TPU).
-        num_tokens_paddings=sorted({1, int(block_size), int(max(1, prefill_bucket))}),
+        # TPU stability: baseline only needs the 1-token decode bucket (+ prefill bucket).
+        num_tokens_paddings=sorted({1, int(max(1, prefill_bucket))}),
         num_reqs_max_model_len=1,
         max_pages_per_req=int(metadata.max_num_pages_per_req),
         max_num_reqs=1,
@@ -834,7 +957,7 @@ def esurge_dflash_decode_single(
     for _ in range(int(max_new_tokens)):
         scheduled_full_cpu[0] = 1
         _ctx_unused, greedy_ids, input_ids_buf, position_ids_buf, _m = executor.execute_verify(
-            num_tokens=int(block_size),
+            num_tokens=int(baseline_bucket),
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
             input_ids_buf=input_ids_buf,

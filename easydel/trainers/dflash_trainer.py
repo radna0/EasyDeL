@@ -27,6 +27,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 from easydel.trainers.trainer import Trainer
+from easydel.trainers.base_trainer import DEFAULT_ARGS_JSON_NAME
 from easydel.trainers.trainer_protocol import (
     TrainerConfigureDataloaderOutput,
     TrainerConfigureFunctionOutput,
@@ -41,6 +42,39 @@ from .dflash_config import DFlashConfig
 logger = get_logger(__name__)
 
 
+class _LocalStepCheckpointer:
+    """Minimal checkpoint scheduler for multi-host pmap (replicated params).
+
+    We avoid JAX's tensorstore multiprocess serialization entirely and instead
+    call back into `Trainer._save_state(...)` (which DFlashTrainer overrides) on
+    every host. Each host writes to its *local* filesystem path, so there is no
+    cross-host IO coordination requirement.
+    """
+
+    def __init__(self, *, save_steps: int):
+        self.save_steps = int(save_steps or 0)
+
+    def on_step(
+        self,
+        *,
+        mesh=None,
+        pytree=None,
+        step: int,
+        force: bool = False,
+        true_callbacks: list | None = None,
+        false_callbacks: list | None = None,
+        **_kwargs,
+    ) -> None:
+        should_save = bool(force) or (self.save_steps > 0 and int(step) > 0 and (int(step) % self.save_steps) == 0)
+        callbacks = true_callbacks if should_save else false_callbacks
+        if not callbacks:
+            return
+        dest = f"run-{int(step)}"
+        meta = {"step": int(step), "forced": bool(force)}
+        for cb in callbacks:
+            cb(dest, mesh, meta)
+
+
 def _set_shm_caches() -> None:
     Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
     Path(os.environ["HF_HUB_CACHE"]).mkdir(parents=True, exist_ok=True)
@@ -48,14 +82,49 @@ def _set_shm_caches() -> None:
     Path(os.environ["JAX_COMPILATION_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
     Path(os.environ["TMPDIR"]).mkdir(parents=True, exist_ok=True)
 
-    xla_flags = os.environ.get("XLA_FLAGS", "")
-    if "--xla_tpu_enable_latency_hiding_scheduler" not in xla_flags:
-        os.environ["XLA_FLAGS"] = (xla_flags + " --xla_tpu_enable_latency_hiding_scheduler=true").strip()
+    # TPU XLA flag availability varies by runtime/libtpu version. A bad flag
+    # hard-crashes the process at startup, so keep this opt-in.
+    if os.environ.get("EASYDEL_ENABLE_XLA_LATENCY_HIDING", "0").lower() in ("1", "true", "yes", "y", "on"):
+        xla_flags = os.environ.get("XLA_FLAGS", "")
+        if "--xla_tpu_enable_latency_hiding_scheduler" not in xla_flags:
+            os.environ["XLA_FLAGS"] = (xla_flags + " --xla_tpu_enable_latency_hiding_scheduler=true").strip()
 
 
-def _require_token_present() -> None:
-    if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")):
-        raise RuntimeError("Missing HF token in env (HF_TOKEN or HUGGINGFACE_HUB_TOKEN).")
+def _require_token_present(*, teacher_snapshot_dir: str | None = None) -> None:
+    """Ensure an HF token is available when we might need to hit the Hub.
+
+    Cache-first DFlash training can run entirely from local snapshot directories
+    (only reading `config.json` and `lm_head.weight` from safetensors). In that
+    case, requiring a token is unnecessary and blocks offline/airgapped runs.
+    """
+    if os.environ.get("ALLOW_MISSING_HF_TOKEN", "0").lower() in ("1", "true", "yes", "y", "on"):
+        return
+
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if token:
+        return
+
+    if teacher_snapshot_dir:
+        try:
+            snap = Path(teacher_snapshot_dir).expanduser().resolve()
+            if snap.exists() and (snap / "config.json").is_file():
+                return
+        except Exception:
+            pass
+
+    # Fall back to a cached local token (common on TPU boxes where users have
+    # previously run `huggingface-cli login`).
+    try:
+        from huggingface_hub import HfFolder
+
+        cached = HfFolder.get_token()
+        if cached:
+            os.environ.setdefault("HF_TOKEN", cached)
+            return
+    except Exception:
+        pass
+
+    raise RuntimeError("Missing HF token in env (HF_TOKEN or HUGGINGFACE_HUB_TOKEN).")
 
 
 def _load_lm_head_weight(snapshot_dir: Path) -> jax.Array:
@@ -291,7 +360,7 @@ class DFlashTrainer(Trainer):
             raise TypeError("arguments must be a DFlashConfig")
 
         _set_shm_caches()
-        _require_token_present()
+        _require_token_present(teacher_snapshot_dir=arguments.teacher_snapshot_dir)
 
         if not arguments.cache_dir:
             raise ValueError("DFlashConfig.cache_dir is required")
@@ -382,6 +451,24 @@ class DFlashTrainer(Trainer):
         if jax.process_index() == 0:
             logger.warning("Resuming DFlash training from %s (step=%d)", run_dir, step)
 
+        # --- Multi-host TPU: avoid JAX multiprocess tensorstore serialization for
+        # fully-addressable (replicated) arrays.
+        #
+        # On multi-host, JAX forbids "multiprocess serialization" for fully
+        # addressable arrays because multiple processes could write the same path.
+        # Our DFlash draft state is replicated under pmap, so we use a simple
+        # per-host checkpoint format (msgpack bytes) instead.
+        ckpt_pkl = run_dir / "model" / "graphstate.pkl"
+        if ckpt_pkl.exists():
+            import pickle
+
+            graphstate = pickle.loads(ckpt_pkl.read_bytes())
+            opt_state = state.tx.init(graphstate)
+            step_arr = jnp.asarray(int(step), dtype=jnp.int32)
+            if jax.process_index() == 0:
+                logger.warning("Restored graphstate.pkl (replicated) checkpoint; optimizer state re-initialized.")
+            return state.replace(graphstate=graphstate, opt_state=opt_state, step=step_arr)
+
         self.arguments.ensure_checkpoint_path()
         ckpt = self.arguments.get_streaming_checkpointer()
 
@@ -402,6 +489,50 @@ class DFlashTrainer(Trainer):
             logger.warning("Optimizer state re-initialized on resume (model weights restored).")
 
         return state.replace(graphstate=graphstate, opt_state=opt_state, step=step_arr)
+
+    def _save_state(self, state: EasyDeLState, save_directory: str | None = None, *args, **kwargs) -> str:
+        # Multi-host TPU: do not use tensorstore multiprocess serialization for
+        # fully addressable arrays; save a per-host replicated checkpoint instead.
+        if jax.process_count() > 1:
+            step = self._get_current_step(state)
+            directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
+            directory_name.mkdir(exist_ok=True)
+            self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
+            self._save_readme(directory_name)
+
+            model_dir = directory_name / "model"
+            model_dir.mkdir(exist_ok=True)
+
+            graphstate_host = jax.device_get(state.graphstate)
+            import pickle
+
+            (model_dir / "graphstate.pkl").write_bytes(pickle.dumps(graphstate_host, protocol=pickle.HIGHEST_PROTOCOL))
+
+            # Minimal completion marker for _is_complete_run().
+            (directory_name / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format": "dflash_replicated_pickle_v1",
+                        "step": int(step),
+                        "process_count": int(jax.process_count()),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            return str(directory_name)
+
+        return super()._save_state(state=state, save_directory=save_directory, *args, **kwargs)
+
+    def _create_checkpointer(self):
+        # BaseTrainer always instantiates a streaming Checkpointer. On multi-host
+        # with replicated params, that path will (a) scan metadata in a format we
+        # don't produce and (b) eventually hit JAX's multiprocess serialization
+        # restriction for fully-addressable arrays.
+        if jax.process_count() > 1:
+            return _LocalStepCheckpointer(save_steps=int(getattr(self.arguments, "save_steps", 0) or 0))
+        return super()._create_checkpointer()
 
     def configure_model(self) -> TrainerConfigureModelOutput:
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
@@ -679,11 +810,16 @@ class DFlashTrainer(Trainer):
         )
 
         self.arguments.ensure_checkpoint_path()
+        if jax.process_count() > 1:
+            checkpoint_manager = _LocalStepCheckpointer(save_steps=int(getattr(self.arguments, "save_steps", 0) or 0))
+        else:
+            checkpoint_manager = self.arguments.get_streaming_checkpointer()
+
         return TrainerConfigureFunctionOutput(
             sharded_training_step_function=sharded_training_step_function,
             sharded_evaluation_step_function=sharded_evaluation_step_function,
             mesh=self.model.mesh,
-            checkpoint_manager=self.arguments.get_streaming_checkpointer(),
+            checkpoint_manager=checkpoint_manager,
         )
 
     def on_step_end(self, state: EasyDeLState, metrics: LossMetrics, step: int):
