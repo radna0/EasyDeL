@@ -5,6 +5,7 @@ import os
 import typing as tp
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 from queue import Queue
 from threading import Thread
 
@@ -40,6 +41,10 @@ from .dflash_cache import DFlashTeacherCacheDataset
 from .dflash_config import DFlashConfig
 
 logger = get_logger(__name__)
+
+def _env_flag(name: str) -> bool:
+    v = os.environ.get(name, "")
+    return v.lower() in ("1", "true", "yes", "y", "on")
 
 
 class _LocalStepCheckpointer:
@@ -90,7 +95,7 @@ def _set_shm_caches() -> None:
             os.environ["XLA_FLAGS"] = (xla_flags + " --xla_tpu_enable_latency_hiding_scheduler=true").strip()
 
 
-def _require_token_present(*, teacher_snapshot_dir: str | None = None) -> None:
+def _require_token_present(*, teacher_snapshot_dir: str | None = None, teacher_easydel_dir: str | None = None) -> None:
     """Ensure an HF token is available when we might need to hit the Hub.
 
     Cache-first DFlash training can run entirely from local snapshot directories
@@ -108,6 +113,14 @@ def _require_token_present(*, teacher_snapshot_dir: str | None = None) -> None:
         try:
             snap = Path(teacher_snapshot_dir).expanduser().resolve()
             if snap.exists() and (snap / "config.json").is_file():
+                return
+        except Exception:
+            pass
+
+    if teacher_easydel_dir:
+        try:
+            ckpt = Path(teacher_easydel_dir).expanduser().resolve()
+            if ckpt.exists() and (ckpt / "config.json").is_file():
                 return
         except Exception:
             pass
@@ -153,6 +166,43 @@ def _load_lm_head_weight(snapshot_dir: Path) -> jax.Array:
             if name in f.keys():
                 return f.get_tensor(name)
     raise KeyError(f"Missing {name_candidates} in {single_path.name}")
+
+
+def _load_lm_head_weight_from_easydel(teacher_dir: Path) -> jax.Array:
+    """Load lm_head kernel as a JAX array [V,H] from an EasyDeL zarr checkpoint directory."""
+    import tensorstore as ts
+
+    candidates = (
+        teacher_dir / "model" / "lm_head" / "kernel",
+        teacher_dir / "model" / "params" / "lm_head" / "kernel",
+    )
+    kernel_dir = next((p for p in candidates if (p / ".zarray").exists()), None)
+    if kernel_dir is None:
+        raise FileNotFoundError(
+            f"Could not locate EasyDeL lm_head kernel under {teacher_dir} "
+            f"(tried {', '.join(str(p) for p in candidates)})"
+        )
+
+    cfg_path = teacher_dir / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Missing {cfg_path}")
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    vocab_size = int(cfg["vocab_size"])
+    hidden_size = int(cfg["hidden_size"])
+
+    spec = {"driver": "zarr", "kvstore": {"driver": "file", "path": str(kernel_dir)}}
+    arr = ts.open(spec, open=True).result()
+    np_w = arr.read().result()
+    w = jnp.asarray(np_w)
+    if tuple(w.shape) == (vocab_size, hidden_size):
+        return w
+    if tuple(w.shape) == (hidden_size, vocab_size):
+        return jnp.swapaxes(w, 0, 1)
+    raise ValueError(
+        "Unexpected lm_head kernel shape from EasyDeL zarr checkpoint: "
+        f"got={tuple(w.shape)} expected={(vocab_size, hidden_size)} or {(hidden_size, vocab_size)} "
+        f"(teacher_dir={teacher_dir})"
+    )
 
 
 def _build_rope(*, cfg: dict, dtype):
@@ -229,6 +279,71 @@ def _is_complete_run(run_dir: Path) -> bool:
     # state (see `_maybe_resume_state`). Optimizer state may be intentionally
     # skipped to reduce checkpoint IO, so `tx/` is optional.
     return True
+
+
+def _prune_old_run_dirs(run_root: Path, *, keep: int = 2) -> None:
+    """Keep at most `keep` newest run-* dirs under run_root (best-effort)."""
+    run_root = Path(str(run_root))
+    if keep <= 0 or not run_root.is_dir():
+        return
+    runs: list[tuple[int, Path]] = []
+    for child in run_root.iterdir():
+        step = _parse_run_step(child)
+        if step is None:
+            continue
+        if not _is_complete_run(child):
+            continue
+        runs.append((int(step), child))
+    runs.sort(key=lambda x: x[0], reverse=True)
+    for _step, path in runs[int(keep) :]:
+        try:
+            shutil.rmtree(str(path))
+        except Exception:
+            pass
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_bytes(data)
+    os.replace(str(tmp), str(path))
+
+
+def _maybe_gunzip(data: bytes) -> bytes:
+    if len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B:
+        import gzip
+
+        return gzip.decompress(data)
+    return data
+
+
+def _free_gb(path: Path) -> float:
+    usage = shutil.disk_usage(str(Path(str(path))))
+    return float(usage.free) / float(1024**3)
+
+
+def _ensure_free_space(run_root: Path, *, min_free_gb: float, keep_runs: int) -> None:
+    """Best-effort space guardrail for TPU VM root disks (never raises)."""
+    run_root = Path(str(run_root))
+    try:
+        _prune_old_run_dirs(run_root, keep=int(keep_runs))
+    except Exception:
+        pass
+    try:
+        if _free_gb(run_root) >= float(min_free_gb):
+            return
+    except Exception:
+        return
+    # Second-chance cleanup: these can balloon quickly on TPU VMs.
+    for extra in (Path.home() / "tmp", Path.home() / ".cache", Path.home() / "harmony_logs"):
+        try:
+            if extra.exists():
+                shutil.rmtree(extra, ignore_errors=True)
+        except Exception:
+            pass
+    try:
+        _prune_old_run_dirs(run_root, keep=int(keep_runs))
+    except Exception:
+        pass
 
 
 def _find_latest_complete_run(run_root: Path) -> tuple[Path, int] | None:
@@ -360,24 +475,48 @@ class DFlashTrainer(Trainer):
             raise TypeError("arguments must be a DFlashConfig")
 
         _set_shm_caches()
-        _require_token_present(teacher_snapshot_dir=arguments.teacher_snapshot_dir)
+        _require_token_present(
+            teacher_snapshot_dir=arguments.teacher_snapshot_dir,
+            teacher_easydel_dir=getattr(arguments, "teacher_easydel_dir", None),
+        )
 
         if not arguments.cache_dir:
             raise ValueError("DFlashConfig.cache_dir is required")
-        if not arguments.teacher_snapshot_dir:
-            raise ValueError("DFlashConfig.teacher_snapshot_dir is required")
+        teacher_snapshot_dir = arguments.teacher_snapshot_dir
+        teacher_easydel_dir = getattr(arguments, "teacher_easydel_dir", None)
+        if bool(teacher_snapshot_dir) == bool(teacher_easydel_dir):
+            raise ValueError(
+                "Provide exactly one of DFlashConfig.teacher_snapshot_dir or DFlashConfig.teacher_easydel_dir"
+            )
 
         self.arguments = arguments
         self.cache = DFlashTeacherCacheDataset(arguments.cache_dir)
-        self.teacher_snapshot = Path(arguments.teacher_snapshot_dir).resolve()
+        self.teacher_snapshot = Path(teacher_snapshot_dir).resolve() if teacher_snapshot_dir else None
+        self.teacher_easydel_dir = Path(teacher_easydel_dir).resolve() if teacher_easydel_dir else None
 
         meta = self.cache.meta
         if meta.dtype not in ("bf16_u16",):
             raise ValueError(f"Unsupported cache dtype {meta.dtype!r}; expected bf16_u16")
 
-        teacher_cfg = json.loads((self.teacher_snapshot / "config.json").read_text(encoding="utf-8"))
+        teacher_root = self.teacher_snapshot if self.teacher_snapshot is not None else self.teacher_easydel_dir
+        if teacher_root is None:
+            raise RuntimeError("Internal error: missing teacher root")
+        teacher_cfg = json.loads((teacher_root / "config.json").read_text(encoding="utf-8"))
         self._rope = _build_rope(cfg=teacher_cfg, dtype=jnp.bfloat16)
-        self._lm_head_weight = jax.lax.stop_gradient(_load_lm_head_weight(self.teacher_snapshot))
+        if self.teacher_snapshot is not None:
+            lm_w = _load_lm_head_weight(self.teacher_snapshot)
+        else:
+            lm_w = _load_lm_head_weight_from_easydel(self.teacher_easydel_dir)  # type: ignore[arg-type]
+        try:
+            expected_vocab = int(teacher_cfg["vocab_size"])
+            expected_hidden = int(teacher_cfg["hidden_size"])
+            if tuple(lm_w.shape) != (expected_vocab, expected_hidden):
+                raise ValueError(
+                    f"lm_head.weight shape mismatch: got={tuple(lm_w.shape)} expected={(expected_vocab, expected_hidden)}"
+                )
+        except Exception as e:
+            raise ValueError(f"Invalid lm_head weight loaded from teacher root {teacher_root}: {e}") from e
+        self._lm_head_weight = jax.lax.stop_gradient(lm_w)
 
         dcfg = DFlashDraftModelConfig(
             hidden_size=int(meta.hidden_size),
@@ -413,7 +552,21 @@ class DFlashTrainer(Trainer):
         if train_dataset is None:
             from datasets import Dataset
 
-            train_dataset = Dataset.from_dict({"idx": np.arange(len(self.cache), dtype=np.int64)})
+            # IMPORTANT: EasyDeL's Trainer loop expects the input iterator to
+            # sustain `max_training_steps`. With a finite Dataset, StopIteration
+            # can terminate training early (well below max_training_steps),
+            # especially for large global batch sizes.
+            #
+            # Build a deterministic repeated index stream long enough for the
+            # configured training budget.
+            cache_len = int(len(self.cache))
+            target_rows = int(getattr(arguments, "max_training_steps", 0) or 0) * int(
+                getattr(arguments, "total_batch_size", 1) or 1
+            ) * int(getattr(arguments, "gradient_accumulation_steps", 1) or 1)
+            if target_rows <= 0:
+                target_rows = cache_len
+            idx = (np.arange(target_rows, dtype=np.int64) % max(1, cache_len)).astype(np.int64)
+            train_dataset = Dataset.from_dict({"idx": idx})
 
         super().__init__(
             arguments=arguments,
@@ -458,15 +611,42 @@ class DFlashTrainer(Trainer):
         # addressable arrays because multiple processes could write the same path.
         # Our DFlash draft state is replicated under pmap, so we use a simple
         # per-host checkpoint format (msgpack bytes) instead.
-        ckpt_pkl = run_dir / "model" / "graphstate.pkl"
-        if ckpt_pkl.exists():
-            import pickle
+        ckpt_dir = run_dir / "model"
+        ckpt_msgpack = ckpt_dir / "graphstate.msgpack"
+        ckpt_pkl = ckpt_dir / "graphstate.pkl"
+        if ckpt_msgpack.exists():
+            from flax import serialization as flax_serialization
 
-            graphstate = pickle.loads(ckpt_pkl.read_bytes())
+            raw = ckpt_msgpack.read_bytes()
+            try:
+                # Legacy format: msgpack produced by flax_serialization.to_bytes(...).
+                graphstate = flax_serialization.from_bytes(state.graphstate, raw)
+            except Exception:
+                # New format: msgpack of a flax serialization state_dict.
+                state_dict = flax_serialization.msgpack_restore(raw)
+                graphstate = flax_serialization.from_state_dict(state.graphstate, state_dict)
             opt_state = state.tx.init(graphstate)
             step_arr = jnp.asarray(int(step), dtype=jnp.int32)
             if jax.process_index() == 0:
-                logger.warning("Restored graphstate.pkl (replicated) checkpoint; optimizer state re-initialized.")
+                logger.warning("Restored replicated checkpoint (graphstate.msgpack); optimizer state re-initialized.")
+            return state.replace(graphstate=graphstate, opt_state=opt_state, step=step_arr)
+        elif ckpt_pkl.exists():
+            import pickle
+            from flax import serialization as flax_serialization
+
+            raw = _maybe_gunzip(ckpt_pkl.read_bytes())
+            graph_or_state_dict = pickle.loads(raw)
+            try:
+                graphstate = flax_serialization.from_state_dict(state.graphstate, graph_or_state_dict)
+            except Exception:
+                graphstate = graph_or_state_dict
+            opt_state = state.tx.init(graphstate)
+            step_arr = jnp.asarray(int(step), dtype=jnp.int32)
+            if jax.process_index() == 0:
+                logger.warning(
+                    "Restored replicated checkpoint (%s); optimizer state re-initialized.",
+                    "graphstate.msgpack" if ckpt_msgpack.exists() else "graphstate.pkl",
+                )
             return state.replace(graphstate=graphstate, opt_state=opt_state, step=step_arr)
 
         self.arguments.ensure_checkpoint_path()
@@ -503,24 +683,54 @@ class DFlashTrainer(Trainer):
             model_dir = directory_name / "model"
             model_dir.mkdir(exist_ok=True)
 
-            graphstate_host = jax.device_get(state.graphstate)
-            import pickle
+            # Keep disk usage under control *before* writing a potentially large
+            # checkpoint on TPU VM root disks.
+            _ensure_free_space(
+                directory_name.parent,
+                min_free_gb=float(os.environ.get("DFLASH_MIN_FREE_GB", "8.0")),
+                keep_runs=int(os.environ.get("DFLASH_KEEP_RUN_DIRS", "2")),
+            )
 
-            (model_dir / "graphstate.pkl").write_bytes(pickle.dumps(graphstate_host, protocol=pickle.HIGHEST_PROTOCOL))
+            graphstate_host = jax.device_get(state.graphstate)
+            # Prefer Flax msgpack (typically smaller + more stable) over pickle,
+            # but fall back to pickle when the graphstate contains objects that
+            # msgpack cannot serialize (e.g. flax.nnx State containers).
+            from flax import serialization as flax_serialization
+
+            saved_format = "dflash_replicated_pickle_v1"
+            try:
+                import pickle
+                import gzip
+
+                raw = pickle.dumps(graphstate_host, protocol=pickle.HIGHEST_PROTOCOL)
+                # Default to gzip on multi-host to reduce IO and disk pressure.
+                if str(os.environ.get("DFLASH_CHECKPOINT_GZIP", "1")).lower() in ("1", "true", "yes", "y", "on"):
+                    raw = gzip.compress(raw, compresslevel=int(os.environ.get("DFLASH_CHECKPOINT_GZIP_LEVEL", "3")))
+                    saved_format = "dflash_replicated_pickle_gzip_v2"
+                _atomic_write_bytes(model_dir / "graphstate.pkl", raw)
+            except Exception:
+                # Legacy fallback: try Flax serialization. This can still fail
+                # for some NNX graphstates but is occasionally smaller.
+                _atomic_write_bytes(model_dir / "graphstate.msgpack", flax_serialization.to_bytes(graphstate_host))
+                saved_format = "dflash_replicated_msgpack_v1"
 
             # Minimal completion marker for _is_complete_run().
             (directory_name / "metadata.json").write_text(
                 json.dumps(
                     {
-                        "format": "dflash_replicated_pickle_v1",
+                        "format": saved_format,
                         "step": int(step),
                         "process_count": int(jax.process_count()),
+                        "free_gb": float(_free_gb(directory_name)),
                     },
                     indent=2,
                     sort_keys=True,
                 ),
                 encoding="utf-8",
             )
+            # Avoid filling the small TPU VM root disk by keeping only a couple
+            # of the most recent run-* directories on each host.
+            _prune_old_run_dirs(directory_name.parent, keep=int(os.environ.get("DFLASH_KEEP_RUN_DIRS", "2")))
             return str(directory_name)
 
         return super()._save_state(state=state, save_directory=save_directory, *args, **kwargs)
@@ -593,10 +803,26 @@ class DFlashTrainer(Trainer):
         if bs <= 0:
             raise ValueError(f"Invalid training_batch_size={bs}")
 
-        use_spmd = bool(self.arguments.spmd)
-        dp = int(self.arguments.dp) if use_spmd else int(jax.local_device_count())
-        if bs % dp != 0:
-            raise ValueError(f"training_batch_size={bs} must be divisible by dp={dp}")
+        # This trainer shards via `jax.pmap`. Under multi-host JAX, pmap expects
+        # host-local arrays shaped `[local_device_count, ...]`; JAX will
+        # automatically combine them into global arrays across all hosts.
+        #
+        # Therefore, `training_batch_size` is interpreted as the GLOBAL batch
+        # size. We split it evenly across all global devices, and each host
+        # yields only its local shard.
+        dp_local = int(jax.local_device_count())
+        dp_global = dp_local * int(jax.process_count())
+        if bs % dp_global != 0:
+            raise ValueError(
+                f"training_batch_size={bs} must be divisible by global_dp={dp_global} "
+                f"(local_dp={dp_local} process_count={int(jax.process_count())})"
+            )
+
+        # Each host should fetch a disjoint shard of the GLOBAL batch.
+        # Per-host batch = global_batch / process_count.
+        bs_host = bs // int(jax.process_count())
+        if bs_host <= 0:
+            raise ValueError(f"Derived per-host batch is invalid: bs_host={bs_host} (bs={bs})")
 
         steps = int(self.arguments.max_training_steps or 0)
         if steps <= 0:
@@ -610,49 +836,62 @@ class DFlashTrainer(Trainer):
 
         class _CachePrefetchLoader:
             def __iter__(self_inner):
-                rng = np.random.default_rng(seed)
+                # Each host uses a different seed so that any fallback random
+                # sampling doesn't duplicate across hosts.
+                rng = np.random.default_rng(seed + int(jax.process_index()))
                 n = len(self.cache)
                 order = np.arange(n, dtype=np.int64)
                 if shuffle:
                     rng.shuffle(order)
-                pos = 0
+                # Each host takes a disjoint slice of the shuffled order.
+                pos = int(jax.process_index()) * bs_host
 
                 q: Queue = Queue(maxsize=prefetch)
 
                 def _worker():
                     nonlocal pos
                     while True:
-                        if bs > n:
-                            idx = rng.integers(0, n, size=bs, dtype=np.int64)
+                        # If the cache is smaller than the *global* batch, we
+                        # cannot take disjoint host slices without producing an
+                        # empty slice on higher process_index hosts. Fall back
+                        # to random sampling with replacement (host-seeded) so
+                        # training stays correct and never yields a zero batch.
+                        if (bs_host * int(jax.process_count())) > n:
+                            idx = rng.integers(0, n, size=bs_host, dtype=np.int64)
                             q.put(self.cache.get_batch(idx))
                             continue
-                        if pos + bs > n:
+                        if bs_host > n:
+                            idx = rng.integers(0, n, size=bs_host, dtype=np.int64)
+                            q.put(self.cache.get_batch(idx))
+                            continue
+                        if pos + bs_host > n:
                             if shuffle:
                                 rng.shuffle(order)
-                            pos = 0
-                        idx = order[pos : pos + bs]
-                        pos += bs
+                            pos = int(jax.process_index()) * bs_host
+                        idx = order[pos : pos + bs_host]
+                        pos += bs_host * int(jax.process_count())
                         q.put(self.cache.get_batch(idx))
 
                 for _ in range(workers):
                     Thread(target=_worker, daemon=True).start()
 
-                per = bs // dp
+                per = bs // dp_global
                 while True:
                     batch = q.get()
-                    if not use_spmd:
-                        batch = {
-                            "context_features_u16": batch["context_features_u16"].reshape(
-                                (dp, per) + tuple(batch["context_features_u16"].shape[1:])
-                            ),
-                            "anchor_embedding_u16": batch["anchor_embedding_u16"].reshape(
-                                (dp, per) + tuple(batch["anchor_embedding_u16"].shape[1:])
-                            ),
-                            "target_ids": batch["target_ids"].reshape((dp, per) + tuple(batch["target_ids"].shape[1:])),
-                            "ctx_pos_start_i32": batch["ctx_pos_start_i32"].reshape(
-                                (dp, per) + tuple(batch["ctx_pos_start_i32"].shape[1:])
-                            ),
-                        }
+                    batch = {
+                        "context_features_u16": batch["context_features_u16"].reshape(
+                            (dp_local, per) + tuple(batch["context_features_u16"].shape[1:])
+                        ),
+                        "anchor_embedding_u16": batch["anchor_embedding_u16"].reshape(
+                            (dp_local, per) + tuple(batch["anchor_embedding_u16"].shape[1:])
+                        ),
+                        "target_ids": batch["target_ids"].reshape(
+                            (dp_local, per) + tuple(batch["target_ids"].shape[1:])
+                        ),
+                        "ctx_pos_start_i32": batch["ctx_pos_start_i32"].reshape(
+                            (dp_local, per) + tuple(batch["ctx_pos_start_i32"].shape[1:])
+                        ),
+                    }
                     yield batch
 
         loader = _CachePrefetchLoader()
@@ -667,6 +906,8 @@ class DFlashTrainer(Trainer):
         meta = self.cache.meta
         rope = self._rope
         lm_w = self._lm_head_weight
+        debug_shapes = _env_flag("DFLASH_DEBUG_SHAPES")
+        debug_raise_shapes = _env_flag("DFLASH_DEBUG_RAISE_SHAPES")
 
         hidden_size = int(meta.hidden_size)
         ctx_len = int(meta.ctx_len)
@@ -693,6 +934,23 @@ class DFlashTrainer(Trainer):
                 module = nnx.merge(graphdef, graphstate, graphother)
                 out = module(context_features=context, anchor_embedding=anchor, rope=rope, ctx_pos_start=ctx_pos_start)
                 hs = out[:, 1:, :]
+                if debug_raise_shapes:
+                    raise ValueError(
+                        "DFLASH_DEBUG_RAISE_SHAPES "
+                        f"module={module.__class__.__name__} "
+                        f"context={context.shape} anchor={anchor.shape} "
+                        f"out={out.shape} hs={hs.shape} labels={labels.shape} lm_w={lm_w.shape}"
+                    )
+                if debug_shapes:
+                    jax.debug.print(
+                        "[dflash][train] context={c} anchor={a} out={o} hs={h} labels={l} lm_w={w}",
+                        c=context.shape,
+                        a=anchor.shape,
+                        o=out.shape,
+                        h=hs.shape,
+                        l=labels.shape,
+                        w=lm_w.shape,
+                    )
                 loss, acc = _chunked_ce_nll_and_acc(hs=hs, labels=labels, lm_w=lm_w, vocab_chunk=vocab_chunk)
                 # Stash accuracy in a closed-over variable by returning it via aux.
                 # jax.value_and_grad supports aux through `has_aux=True`.
@@ -797,6 +1055,23 @@ class DFlashTrainer(Trainer):
             ctx_pos_start = batch_obj.ctx_pos_start.astype(jnp.int32).reshape((-1,))
             out = module(context_features=context, anchor_embedding=anchor, rope=rope, ctx_pos_start=ctx_pos_start)
             hs = out[:, 1:, :]
+            if debug_raise_shapes:
+                raise ValueError(
+                    "DFLASH_DEBUG_RAISE_SHAPES "
+                    f"module={module.__class__.__name__} "
+                    f"context={context.shape} anchor={anchor.shape} "
+                    f"out={out.shape} hs={hs.shape} labels={labels.shape} lm_w={lm_w.shape}"
+                )
+            if debug_shapes:
+                jax.debug.print(
+                    "[dflash][eval] context={c} anchor={a} out={o} hs={h} labels={l} lm_w={w}",
+                    c=context.shape,
+                    a=anchor.shape,
+                    o=out.shape,
+                    h=hs.shape,
+                    l=labels.shape,
+                    w=lm_w.shape,
+                )
             loss, acc = _chunked_ce_nll_and_acc(hs=hs, labels=labels, lm_w=lm_w, vocab_chunk=vocab_chunk)
             loss = jax.lax.pmean(loss, "dp")
             acc = jax.lax.pmean(acc, "dp")

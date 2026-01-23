@@ -24,6 +24,13 @@ class DFlashConfig(TrainingArguments):
         default=None,
         metadata={"help": "HF snapshot dir for the teacher model (used only to load lm_head.weight)."},
     )
+    teacher_easydel_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": "EasyDeL-native checkpoint directory for the teacher model (used only to load config.json + lm_head). "
+            "Prefer this when you want to avoid downloading a full HF safetensors snapshot on TPU."
+        },
+    )
 
     # Draft architecture.
     draft_layers: int = field(default=8, metadata={"help": "Number of draft transformer layers."})
@@ -85,4 +92,3 @@ class DFlashConfig(TrainingArguments):
     )
 
     __hash__ = hash_fn
-

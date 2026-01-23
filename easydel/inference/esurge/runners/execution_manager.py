@@ -1190,8 +1190,24 @@ class ExecutionManager:
         active_reqs = max(1, min(padded_num_reqs, max_num_reqs, num_tokens))
         scheduled_full_cpu[:active_reqs] = 1
         active_mask_full_cpu[:active_reqs] = True
-        input_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
-        position_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
+
+        # Multi-host robustness (TPU pods): `jax.device_put(..., NamedSharding)`
+        # triggers cross-host value equality checks (`multihost_utils.assert_equal`)
+        # which can crash/hang on some TPU runtimes during compile-time dummy
+        # input creation. These buffers are only used for compilation tracing, so
+        # prefer `ShapeDtypeStruct` with the correct sharding metadata.
+        def _sharded_dummy_1d(dtype):
+            try:
+                return jax.ShapeDtypeStruct(
+                    (self.max_num_tokens,),
+                    dtype,
+                    sharding=self._empty_sharding,
+                )
+            except TypeError:
+                return jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=dtype), self._empty_sharding)
+
+        input_ids_buf = _sharded_dummy_1d(jnp.int32)
+        position_ids_buf = _sharded_dummy_1d(jnp.int32)
 
         mrope_position_ids_cpu = None
         prefill_embeds_cpu = None

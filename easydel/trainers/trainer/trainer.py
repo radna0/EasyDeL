@@ -491,7 +491,22 @@ class Trainer(BaseTrainer):
                 batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                 step_metrics.start_step()
                 state = self.on_step_start(state=state, step=current_step)
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exect:
+            except StopIteration as exect:
+                # StopIteration is surprisingly common with Python iterators, and
+                # in multi-host TPU runs this can silently truncate training far
+                # below `max_training_steps` if the input pipeline is not truly
+                # infinite. Log explicitly so the orchestrator logs always show
+                # why we stopped early.
+                logger.warning(
+                    "Training iterator exhausted (StopIteration). "
+                    f"epoch={epoch} step={current_step} max_steps={self.max_training_steps}"
+                )
+                return state, exect, train_iter
+            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as exect:
+                logger.warning(
+                    f"Training interrupted: {exect.__class__.__name__} "
+                    f"epoch={epoch} step={current_step} max_steps={self.max_training_steps}"
+                )
                 return state, exect, train_iter
 
             # Execute training step
@@ -557,9 +572,21 @@ class Trainer(BaseTrainer):
                 if self._should_run_evaluation(current_step):
                     for _ in self.eval(model_state=state):
                         ...
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                return state, run_exception, train_iter
+            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError) as exect:
+                # This catch-all historically swallowed errors (returning
+                # `run_exception` which may be None). Always surface the real
+                # exception in logs so multi-host jobs don't "end early" with no
+                # diagnosable reason.
+                logger.warning(
+                    f"Training step aborted: {exect.__class__.__name__} "
+                    f"epoch={epoch} step={current_step} max_steps={self.max_training_steps}: {exect}"
+                )
+                return state, exect, train_iter
             if run_exception is not None:
+                logger.warning(
+                    "Stopping training due to run_exception from _execute_train_step: "
+                    f"{run_exception.__class__.__name__} epoch={epoch} step={current_step}: {run_exception}"
+                )
                 break
         return state, run_exception, train_iter
 
